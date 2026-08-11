@@ -1,0 +1,9 @@
+mistralai
+faiss-cpu
+rank-bm25
+pandas
+numpy
+scikit-learn
+python-dotenv
+streamlit
+tqdm
