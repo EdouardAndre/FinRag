@@ -1,5 +1,6 @@
 # Local data and generated RAG artifacts
 /data/
+/results/
 *.faiss
 *index_metadata.json
 chunks.json
