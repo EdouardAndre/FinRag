@@ -27,3 +27,8 @@ class Chunk:
     source_ids: list[str]
     metadata: dict[str, Any] = field(default_factory=dict)
 
+@dataclass(frozen=True)
+class RetrievalResult:
+    rank: int
+    score: float
+    chunk: Chunk
