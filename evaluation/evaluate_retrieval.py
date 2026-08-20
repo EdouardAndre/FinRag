@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 try:
     from src.load_data import load_finqa_examples
-    from src.retrieve import load_retrieval_artifacts, retrieve
+    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve
     from src.schemas import FinancialExample, RetrievalResult
 except ImportError:
     import sys
@@ -15,12 +15,12 @@ except ImportError:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
     from src.load_data import load_finqa_examples
-    from src.retrieve import load_retrieval_artifacts, retrieve
+    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve
     from src.schemas import FinancialExample, RetrievalResult
 
 
 DEFAULT_DATASET_PATH = Path("data/FinQA/dataset/dev.json")
-DEFAULT_RESULTS_PATH = Path("results/retrieval_failures.csv")
+DEFAULT_RESULTS_DIR = Path("results")
 DEFAULT_LIMIT = 100
 DEFAULT_MAX_K = 10
 DEFAULT_CUTOFFS = (1, 3, 5, 10)
@@ -67,6 +67,9 @@ def evaluate_example(
     index,
     metadata: dict,
     max_k: int,
+    method: str,
+    bm25_index,
+    candidate_k: int,
 ) -> RetrievalEvaluation:
     results = retrieve(
         example.question,
@@ -74,6 +77,9 @@ def evaluate_example(
         index=index,
         metadata=metadata,
         top_k=max_k,
+        method=method,
+        bm25_index=bm25_index,
+        candidate_k=candidate_k,
     )
     retrieved_ids = source_ids_from_results(results)
     gold_ids = set(example.gold_evidence.keys())
@@ -154,32 +160,42 @@ def save_failures(
             )
 
 
-def print_metrics(metrics: dict[str, float]) -> None:
+def default_failures_path(method: str) -> Path:
+    return DEFAULT_RESULTS_DIR / f"{method}_retrieval_failures.csv"
+
+
+def print_metrics(metrics: dict[str, float | str]) -> None:
     print("Retrieval evaluation")
     print("=" * 80)
     for name, value in metrics.items():
-        if name == "examples":
+        if isinstance(value, str):
+            print(f"{name}: {value}")
+        elif name == "examples":
             print(f"{name}: {int(value)}")
         else:
             print(f"{name}: {value:.4f}")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate dense retrieval against FinQA gold evidence IDs.")
+    parser = argparse.ArgumentParser(description="Evaluate retrieval against FinQA gold evidence IDs.")
     parser.add_argument("--dataset-path", default=str(DEFAULT_DATASET_PATH))
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--max-k", type=int, default=DEFAULT_MAX_K)
+    parser.add_argument("--candidate-k", type=int, default=DEFAULT_MAX_K)
+    parser.add_argument("--method", choices=["dense", "bm25", "hybrid"], default="dense")
     parser.add_argument("--failure-cutoff", type=int, default=5)
-    parser.add_argument("--failures-path", default=str(DEFAULT_RESULTS_PATH))
+    parser.add_argument("--failures-path")
     return parser.parse_args()
 
 
 def main() -> None:
     load_dotenv()
     args = parse_args()
+    candidate_k = max(args.candidate_k, args.max_k)
 
     examples = load_finqa_examples(path=args.dataset_path, limit=args.limit)
     chunks, index, metadata = load_retrieval_artifacts(limit=args.limit)
+    bm25_index = build_bm25_index(chunks) if args.method in {"bm25", "hybrid"} else None
 
     evaluations = [
         evaluate_example(
@@ -188,14 +204,20 @@ def main() -> None:
             index=index,
             metadata=metadata,
             max_k=args.max_k,
+            method=args.method,
+            bm25_index=bm25_index,
+            candidate_k=candidate_k,
         )
         for example in examples
     ]
 
     metrics = summarize_evaluations(evaluations)
+    metrics = {"method": args.method, **metrics}
     print_metrics(metrics)
-    save_failures(evaluations, args.failures_path, cutoff=args.failure_cutoff)
-    print(f"failures saved to: {args.failures_path}")
+
+    failures_path = Path(args.failures_path) if args.failures_path else default_failures_path(args.method)
+    save_failures(evaluations, failures_path, cutoff=args.failure_cutoff)
+    print(f"failures saved to: {failures_path}")
 
 
 if __name__ == "__main__":

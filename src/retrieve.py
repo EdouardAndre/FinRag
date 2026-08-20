@@ -1,10 +1,12 @@
 import json
 import argparse
+import re
 from pathlib import Path
 
 import faiss
 import numpy as np
 from dotenv import load_dotenv
+from rank_bm25 import BM25Okapi
 
 try:
     from .embed import ensure_chunks, create_mistral_client, normalize_vectors
@@ -21,6 +23,11 @@ METADATA_PATH = Path("data/index_metadata.json")
 DEFAULT_LIMIT = 100
 DEFAULT_TOP_K = 5
 DEFAULT_MODEL = "mistral-embed"
+DEFAULT_RRF_K = 60
+
+
+def tokenize(text: str) -> list[str]:
+    return re.findall(r"\$?\d+(?:\.\d+)?%?|[a-zA-Z]+(?:\.[a-zA-Z]+)?", text.lower())
 
 
 def load_index_metadata(path: str | Path) -> dict:
@@ -63,6 +70,7 @@ def validate_artifact_alignment(
         raise ValueError("Index metadata appears out of sync with chunks.json.")
 
 
+
 def embed_query(
     query: str,
     model: str = DEFAULT_MODEL,
@@ -92,6 +100,30 @@ def search_index(
 ) -> tuple[np.ndarray, np.ndarray]:
     return index.search(query_vector, k=top_k)
 
+
+def build_bm25_index(chunks: list[Chunk]) -> BM25Okapi:
+    tokenized_chunks = [tokenize(chunk.content) for chunk in chunks]
+    return BM25Okapi(tokenized_chunks)
+
+
+def search_bm25(
+    query: str,
+    bm25_index: BM25Okapi,
+    chunks: list[Chunk],
+    top_k: int = DEFAULT_TOP_K,
+) -> list[RetrievalResult]:
+    scores = bm25_index.get_scores(tokenize(query))
+    ranked_indices = np.argsort(scores)[::-1][:top_k]
+
+    return [
+        RetrievalResult(
+            rank=rank,
+            score=float(scores[index]),
+            chunk=chunks[index],
+        )
+        for rank, index in enumerate(ranked_indices, start=1)
+    ]
+
 def build_retrieval_results(
     scores: np.ndarray,
     indices: np.ndarray,
@@ -115,7 +147,7 @@ def build_retrieval_results(
     return results
 
 
-def retrieve(
+def retrieve_dense(
     query: str,
     chunks: list[Chunk],
     index: faiss.Index,
@@ -129,6 +161,89 @@ def retrieve(
     )
     scores, indices = search_index(index, query_vector, top_k=top_k)
     return build_retrieval_results(scores, indices, chunks)
+
+
+def reciprocal_rank_fusion(
+    rankings: list[list[RetrievalResult]],
+    top_k: int = DEFAULT_TOP_K,
+    rrf_k: int = DEFAULT_RRF_K,
+) -> list[RetrievalResult]:
+    scores: dict[str, float] = {}
+    chunks_by_id: dict[str, Chunk] = {}
+
+    for ranking in rankings:
+        for result in ranking:
+            chunk_id = result.chunk.chunk_id
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1 / (rrf_k + result.rank)
+            chunks_by_id[chunk_id] = result.chunk
+
+    ranked_chunk_ids = sorted(scores, key=scores.get, reverse=True)[:top_k]
+
+    return [
+        RetrievalResult(
+            rank=rank,
+            score=scores[chunk_id],
+            chunk=chunks_by_id[chunk_id],
+        )
+        for rank, chunk_id in enumerate(ranked_chunk_ids, start=1)
+    ]
+
+
+def retrieve_hybrid(
+    query: str,
+    chunks: list[Chunk],
+    index: faiss.Index,
+    metadata: dict,
+    bm25_index: BM25Okapi,
+    top_k: int = DEFAULT_TOP_K,
+    candidate_k: int = 10,
+) -> list[RetrievalResult]:
+    dense_results = retrieve_dense(
+        query,
+        chunks=chunks,
+        index=index,
+        metadata=metadata,
+        top_k=candidate_k,
+    )
+    bm25_results = search_bm25(
+        query,
+        bm25_index=bm25_index,
+        chunks=chunks,
+        top_k=candidate_k,
+    )
+    return reciprocal_rank_fusion([dense_results, bm25_results], top_k=top_k)
+
+
+def retrieve(
+    query: str,
+    chunks: list[Chunk],
+    index: faiss.Index,
+    metadata: dict,
+    top_k: int = DEFAULT_TOP_K,
+    method: str = "dense",
+    bm25_index: BM25Okapi | None = None,
+    candidate_k: int = 10,
+) -> list[RetrievalResult]:
+    if method == "dense":
+        return retrieve_dense(query, chunks=chunks, index=index, metadata=metadata, top_k=top_k)
+
+    if method == "bm25":
+        resolved_bm25_index = bm25_index or build_bm25_index(chunks)
+        return search_bm25(query, resolved_bm25_index, chunks, top_k=top_k)
+
+    if method == "hybrid":
+        resolved_bm25_index = bm25_index or build_bm25_index(chunks)
+        return retrieve_hybrid(
+            query,
+            chunks=chunks,
+            index=index,
+            metadata=metadata,
+            bm25_index=resolved_bm25_index,
+            top_k=top_k,
+            candidate_k=candidate_k,
+        )
+
+    raise ValueError(f"Unsupported retrieval method: {method}")
 
 
 def print_retrieval_results(results: list[RetrievalResult]) -> None:
@@ -146,10 +261,12 @@ def print_retrieval_results(results: list[RetrievalResult]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run dense retrieval over the FinQA FAISS index.")
+    parser = argparse.ArgumentParser(description="Run retrieval over the FinQA chunk index.")
     parser.add_argument("--query", required=True)
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument("--candidate-k", type=int, default=10)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    parser.add_argument("--method", choices=["dense", "bm25", "hybrid"], default="dense")
     return parser.parse_args()
 
 def main() -> None:
@@ -159,7 +276,17 @@ def main() -> None:
     chunks, index, metadata = load_retrieval_artifacts(
         limit=args.limit,
     )
-    results = retrieve(args.query, chunks, index, metadata, top_k=args.top_k)
+    bm25_index = build_bm25_index(chunks) if args.method in {"bm25", "hybrid"} else None
+    results = retrieve(
+        args.query,
+        chunks,
+        index,
+        metadata,
+        top_k=args.top_k,
+        method=args.method,
+        bm25_index=bm25_index,
+        candidate_k=args.candidate_k,
+    )
     print_retrieval_results(results)
 
 if __name__ == "__main__":
