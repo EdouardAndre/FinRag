@@ -32,3 +32,17 @@ class RetrievalResult:
     rank: int
     score: float
     chunk: Chunk
+
+
+@dataclass(frozen=True)
+class Citation:
+    chunk_id: str
+    quote: str
+
+
+@dataclass(frozen=True)
+class RAGAnswer:
+    answer: str
+    citations: list[Citation]
+    calculation: str | None
+    insufficient_evidence: bool
