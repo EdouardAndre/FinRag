@@ -167,6 +167,7 @@ def run_rag(
     method: str = "dense",
     top_k: int = DEFAULT_TOP_K,
     candidate_k: int = 10,
+    neighbor_window: int = 0,
     limit: int = DEFAULT_LIMIT,
     model: str = DEFAULT_MODEL,
 ) -> tuple[RAGAnswer, list[RetrievalResult]]:
@@ -181,6 +182,7 @@ def run_rag(
         method=method,
         bm25_index=bm25_index,
         candidate_k=candidate_k,
+        neighbor_window=neighbor_window,
     )
     answer = generate_answer(question, results, model=model)
     return answer, results
@@ -196,6 +198,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", choices=["dense", "bm25", "hybrid"], default="dense")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--candidate-k", type=int, default=10)
+    parser.add_argument("--neighbor-window", type=int, default=0)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--show-evidence", action="store_true")
@@ -211,6 +214,7 @@ def main() -> None:
         method=args.method,
         top_k=args.top_k,
         candidate_k=args.candidate_k,
+        neighbor_window=args.neighbor_window,
         limit=args.limit,
         model=args.model,
     )

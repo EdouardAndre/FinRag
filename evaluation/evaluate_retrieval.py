@@ -70,6 +70,7 @@ def evaluate_example(
     method: str,
     bm25_index,
     candidate_k: int,
+    neighbor_window: int,
 ) -> RetrievalEvaluation:
     results = retrieve(
         example.question,
@@ -80,6 +81,7 @@ def evaluate_example(
         method=method,
         bm25_index=bm25_index,
         candidate_k=candidate_k,
+        neighbor_window=neighbor_window,
     )
     retrieved_ids = source_ids_from_results(results)
     gold_ids = set(example.gold_evidence.keys())
@@ -182,6 +184,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--max-k", type=int, default=DEFAULT_MAX_K)
     parser.add_argument("--candidate-k", type=int, default=DEFAULT_MAX_K)
+    parser.add_argument("--neighbor-window", type=int, default=0)
     parser.add_argument("--method", choices=["dense", "bm25", "hybrid"], default="dense")
     parser.add_argument("--failure-cutoff", type=int, default=5)
     parser.add_argument("--failures-path")
@@ -207,6 +210,7 @@ def main() -> None:
             method=args.method,
             bm25_index=bm25_index,
             candidate_k=candidate_k,
+            neighbor_window=args.neighbor_window,
         )
         for example in examples
     ]

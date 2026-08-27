@@ -24,6 +24,7 @@ DEFAULT_LIMIT = 100
 DEFAULT_TOP_K = 5
 DEFAULT_MODEL = "mistral-embed"
 DEFAULT_RRF_K = 60
+DEFAULT_NEIGHBOR_WINDOW = 0
 
 
 def tokenize(text: str) -> list[str]:
@@ -147,6 +148,65 @@ def build_retrieval_results(
     return results
 
 
+def neighbor_key(chunk: Chunk) -> tuple[str, str, int] | None:
+    if chunk.chunk_type == "table":
+        row_index = chunk.metadata.get("row_index")
+    else:
+        row_index = chunk.metadata.get("row_index")
+
+    if row_index is None:
+        return None
+
+    return (chunk.example_id, chunk.section, int(row_index))
+
+
+def build_neighbor_lookup(chunks: list[Chunk]) -> dict[tuple[str, str, int], Chunk]:
+    lookup = {}
+
+    for chunk in chunks:
+        key = neighbor_key(chunk)
+        if key is not None:
+            lookup[key] = chunk
+
+    return lookup
+
+
+def expand_with_neighbors(
+    results: list[RetrievalResult],
+    chunks: list[Chunk],
+    neighbor_window: int = DEFAULT_NEIGHBOR_WINDOW,
+) -> list[RetrievalResult]:
+    if neighbor_window <= 0:
+        return results
+
+    lookup = build_neighbor_lookup(chunks)
+    expanded_chunks: dict[str, tuple[float, Chunk]] = {}
+
+    for result in results:
+        chunk = result.chunk
+        expanded_chunks.setdefault(chunk.chunk_id, (result.score, chunk))
+
+        key = neighbor_key(chunk)
+        if key is None:
+            continue
+
+        example_id, section, row_index = key
+        for offset in range(-neighbor_window, neighbor_window + 1):
+            if offset == 0:
+                continue
+
+            neighbor = lookup.get((example_id, section, row_index + offset))
+            if neighbor is None:
+                continue
+
+            expanded_chunks.setdefault(neighbor.chunk_id, (result.score, neighbor))
+
+    return [
+        RetrievalResult(rank=rank, score=score, chunk=chunk)
+        for rank, (score, chunk) in enumerate(expanded_chunks.values(), start=1)
+    ]
+
+
 def retrieve_dense(
     query: str,
     chunks: list[Chunk],
@@ -223,17 +283,20 @@ def retrieve(
     method: str = "dense",
     bm25_index: BM25Okapi | None = None,
     candidate_k: int = 10,
+    neighbor_window: int = DEFAULT_NEIGHBOR_WINDOW,
 ) -> list[RetrievalResult]:
     if method == "dense":
-        return retrieve_dense(query, chunks=chunks, index=index, metadata=metadata, top_k=top_k)
+        results = retrieve_dense(query, chunks=chunks, index=index, metadata=metadata, top_k=top_k)
+        return expand_with_neighbors(results, chunks, neighbor_window=neighbor_window)
 
     if method == "bm25":
         resolved_bm25_index = bm25_index or build_bm25_index(chunks)
-        return search_bm25(query, resolved_bm25_index, chunks, top_k=top_k)
+        results = search_bm25(query, resolved_bm25_index, chunks, top_k=top_k)
+        return expand_with_neighbors(results, chunks, neighbor_window=neighbor_window)
 
     if method == "hybrid":
         resolved_bm25_index = bm25_index or build_bm25_index(chunks)
-        return retrieve_hybrid(
+        results = retrieve_hybrid(
             query,
             chunks=chunks,
             index=index,
@@ -242,6 +305,7 @@ def retrieve(
             top_k=top_k,
             candidate_k=candidate_k,
         )
+        return expand_with_neighbors(results, chunks, neighbor_window=neighbor_window)
 
     raise ValueError(f"Unsupported retrieval method: {method}")
 
@@ -265,6 +329,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query", required=True)
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--candidate-k", type=int, default=10)
+    parser.add_argument("--neighbor-window", type=int, default=DEFAULT_NEIGHBOR_WINDOW)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--method", choices=["dense", "bm25", "hybrid"], default="dense")
     return parser.parse_args()
@@ -286,6 +351,7 @@ def main() -> None:
         method=args.method,
         bm25_index=bm25_index,
         candidate_k=args.candidate_k,
+        neighbor_window=args.neighbor_window,
     )
     print_retrieval_results(results)
 

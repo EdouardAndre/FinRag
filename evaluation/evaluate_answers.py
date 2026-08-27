@@ -224,6 +224,7 @@ def evaluate_answers(
     method: str,
     top_k: int,
     candidate_k: int,
+    neighbor_window: int,
     model: str,
 ) -> list[AnswerEvaluation]:
     chunks, index, metadata = load_retrieval_artifacts(limit=len(examples))
@@ -242,6 +243,7 @@ def evaluate_answers(
                 method=method,
                 bm25_index=bm25_index,
                 candidate_k=max(candidate_k, top_k),
+                neighbor_window=neighbor_window,
             )
             answer = generate_answer(example.question, results, model=model)
             evaluations.append(evaluate_answer(example, answer, results))
@@ -258,6 +260,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", choices=["dense", "bm25", "hybrid"], default="dense")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--candidate-k", type=int, default=10)
+    parser.add_argument("--neighbor-window", type=int, default=0)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--predictions-path", default=str(DEFAULT_RESULTS_PATH))
     return parser.parse_args()
@@ -273,6 +276,7 @@ def main() -> None:
         method=args.method,
         top_k=args.top_k,
         candidate_k=args.candidate_k,
+        neighbor_window=args.neighbor_window,
         model=args.model,
     )
     metrics = {"method": args.method, **summarize_evaluations(evaluations)}
