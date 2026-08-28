@@ -76,6 +76,24 @@ flowchart TD
     EVAL --> RET[Retrieval metrics]
     EVAL --> ANS[Answer metrics]
     EVAL --> ERR[Error analysis CSV]
+
+    classDef input fill:#e0f2fe,stroke:#0284c7,color:#0f172a,stroke-width:2px
+    classDef route fill:#fef3c7,stroke:#d97706,color:#0f172a,stroke-width:2px
+    classDef retrieve fill:#dcfce7,stroke:#16a34a,color:#0f172a,stroke-width:2px
+    classDef store fill:#ede9fe,stroke:#7c3aed,color:#0f172a,stroke-width:2px
+    classDef judge fill:#fae8ff,stroke:#c026d3,color:#0f172a,stroke-width:2px
+    classDef generate fill:#ffe4e6,stroke:#e11d48,color:#0f172a,stroke-width:2px
+    classDef output fill:#ccfbf1,stroke:#0f766e,color:#0f172a,stroke-width:2px
+    classDef eval fill:#f1f5f9,stroke:#475569,color:#0f172a,stroke-width:2px
+
+    class Q input
+    class R,AR,RR,NW,PROG route
+    class D,B,H,CAND,RERANK,KEEP,EXPAND,CONTEXT,REWRITE,CORR,MERGE retrieve
+    class FAISS,BM25 store
+    class G,G2 judge
+    class GEN,EXEC generate
+    class ABSTAIN,OUT output
+    class EVAL,RET,ANS,ERR eval
 ```
 
 ## Repository Layout
