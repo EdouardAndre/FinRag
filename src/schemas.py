@@ -35,6 +35,16 @@ class RetrievalResult:
 
 
 @dataclass(frozen=True)
+class EvidenceGrade:
+    is_sufficient: bool
+    needs_retry: bool
+    confidence: float
+    missing_reason: str | None
+    matched_signals: list[str] = field(default_factory=list)
+    missing_signals: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class Citation:
     chunk_id: str
     quote: str

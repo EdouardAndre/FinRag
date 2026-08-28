@@ -8,8 +8,9 @@ from dotenv import load_dotenv
 
 try:
     from src.generate import generate_answer
+    from src.generate import retrieve_and_grade
     from src.load_data import load_finqa_examples
-    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
+    from src.retrieve import build_bm25_index, load_retrieval_artifacts
     from src.schemas import FinancialExample, RAGAnswer, RetrievalResult
 except ImportError:
     import sys
@@ -17,8 +18,9 @@ except ImportError:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
     from src.generate import generate_answer
+    from src.generate import retrieve_and_grade
     from src.load_data import load_finqa_examples
-    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
+    from src.retrieve import build_bm25_index, load_retrieval_artifacts
     from src.schemas import FinancialExample, RAGAnswer, RetrievalResult
 
 
@@ -43,6 +45,9 @@ class AnswerEvaluation:
     error: str | None
     retrieved_chunk_ids: list[str]
     cited_chunk_ids: list[str]
+    evidence_grade_sufficient: bool | None = None
+    evidence_grade_confidence: float | None = None
+    evidence_grade_reason: str | None = None
 
 
 def normalize_answer(text: str) -> str:
@@ -107,6 +112,9 @@ def evaluate_answer(
     example: FinancialExample,
     answer: RAGAnswer,
     results: list[RetrievalResult],
+    evidence_grade_sufficient: bool | None = None,
+    evidence_grade_confidence: float | None = None,
+    evidence_grade_reason: str | None = None,
 ) -> AnswerEvaluation:
     return AnswerEvaluation(
         example_id=example.example_id,
@@ -124,6 +132,9 @@ def evaluate_answer(
         error=None,
         retrieved_chunk_ids=[result.chunk.chunk_id for result in results],
         cited_chunk_ids=[citation.chunk_id for citation in answer.citations],
+        evidence_grade_sufficient=evidence_grade_sufficient,
+        evidence_grade_confidence=evidence_grade_confidence,
+        evidence_grade_reason=evidence_grade_reason,
     )
 
 
@@ -140,6 +151,9 @@ def failed_evaluation(example: FinancialExample, error: Exception) -> AnswerEval
         error=str(error),
         retrieved_chunk_ids=[],
         cited_chunk_ids=[],
+        evidence_grade_sufficient=None,
+        evidence_grade_confidence=None,
+        evidence_grade_reason=None,
     )
 
 
@@ -185,6 +199,9 @@ def save_predictions(evaluations: list[AnswerEvaluation], path: str | Path) -> N
                 "error",
                 "retrieved_chunk_ids",
                 "cited_chunk_ids",
+                "evidence_grade_sufficient",
+                "evidence_grade_confidence",
+                "evidence_grade_reason",
             ],
         )
         writer.writeheader()
@@ -203,6 +220,9 @@ def save_predictions(evaluations: list[AnswerEvaluation], path: str | Path) -> N
                     "error": evaluation.error or "",
                     "retrieved_chunk_ids": " ".join(evaluation.retrieved_chunk_ids),
                     "cited_chunk_ids": " ".join(evaluation.cited_chunk_ids),
+                    "evidence_grade_sufficient": evaluation.evidence_grade_sufficient,
+                    "evidence_grade_confidence": evaluation.evidence_grade_confidence,
+                    "evidence_grade_reason": evaluation.evidence_grade_reason or "",
                 }
             )
 
@@ -226,24 +246,30 @@ def evaluate_answers(
     candidate_k: int,
     neighbor_window: int,
     model: str,
+    use_evidence_grader: bool,
 ) -> list[AnswerEvaluation]:
     chunks, index, metadata = load_retrieval_artifacts(limit=len(examples))
     bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid", "adaptive"} else None
+    if use_evidence_grader and bm25_index is None:
+        bm25_index = build_bm25_index(chunks)
+
     evaluations = []
 
     for position, example in enumerate(examples, start=1):
         print(f"evaluating {position}/{len(examples)}: {example.example_id}")
         try:
-            results, route = retrieve_with_route(
+            results, route, grade = retrieve_and_grade(
                 example.question,
-                chunks=chunks,
-                index=index,
-                metadata=metadata,
+                chunks,
+                index,
+                metadata,
                 top_k=top_k,
                 method=method,
                 bm25_index=bm25_index,
                 candidate_k=max(candidate_k, top_k),
                 neighbor_window=neighbor_window,
+                use_evidence_grader=use_evidence_grader,
+                return_evidence_grade=use_evidence_grader,
             )
             if not route.related_to_index:
                 answer = RAGAnswer(
@@ -252,11 +278,30 @@ def evaluate_answers(
                     calculation=None,
                     insufficient_evidence=True,
                 )
-                evaluations.append(evaluate_answer(example, answer, results))
+                evaluations.append(
+                    evaluate_answer(
+                        example,
+                        answer,
+                        results,
+                        evidence_grade_sufficient=grade.is_sufficient,
+                        evidence_grade_confidence=grade.confidence,
+                        evidence_grade_reason=grade.missing_reason,
+                    )
+                )
                 continue
 
             answer = generate_answer(example.question, results, model=model)
-            evaluations.append(evaluate_answer(example, answer, results))
+
+            evaluations.append(
+                evaluate_answer(
+                    example,
+                    answer,
+                    results,
+                    evidence_grade_sufficient=grade.is_sufficient if grade else None,
+                    evidence_grade_confidence=grade.confidence if grade else None,
+                    evidence_grade_reason=grade.missing_reason if grade else None,
+                )
+            )
         except Exception as error:
             evaluations.append(failed_evaluation(example, error))
 
@@ -273,6 +318,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neighbor-window", type=int, default=0)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--predictions-path", default=str(DEFAULT_RESULTS_PATH))
+    parser.add_argument("--use-evidence-grader", action="store_true")
     return parser.parse_args()
 
 
@@ -288,6 +334,7 @@ def main() -> None:
         candidate_k=args.candidate_k,
         neighbor_window=args.neighbor_window,
         model=args.model,
+        use_evidence_grader=args.use_evidence_grader,
     )
     metrics = {"method": args.method, **summarize_evaluations(evaluations)}
     print_metrics(metrics)

@@ -9,19 +9,25 @@ from dotenv import load_dotenv
 
 try:
     from .embed import create_mistral_client
+    from .grade_documents import grade_retrieved_evidence
     from .retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
     from .router import RetrievalRoute
-    from .schemas import Citation, RAGAnswer, RetrievalResult
+    from .schemas import Citation, EvidenceGrade, RAGAnswer, RetrievalResult
 except ImportError:
     from embed import create_mistral_client
+    from grade_documents import grade_retrieved_evidence
     from retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
     from router import RetrievalRoute
-    from schemas import Citation, RAGAnswer, RetrievalResult
+    from schemas import Citation, EvidenceGrade, RAGAnswer, RetrievalResult
 
 
 DEFAULT_MODEL = "mistral-small-latest"
 DEFAULT_TOP_K = 5
 DEFAULT_LIMIT = 100
+CORRECTIVE_METHOD = "hybrid"
+CORRECTIVE_TOP_K = 10
+CORRECTIVE_CANDIDATE_K = 30
+CORRECTIVE_NEIGHBOR_WINDOW = 1
 
 
 SYSTEM_PROMPT = """You answer financial questions using only the supplied evidence.
@@ -164,17 +170,19 @@ def generate_answer(
     return answer
 
 
-def run_rag(
+def retrieve_and_grade(
     question: str,
-    method: str = "dense",
-    top_k: int = DEFAULT_TOP_K,
-    candidate_k: int = 10,
-    neighbor_window: int = 0,
-    limit: int = DEFAULT_LIMIT,
-    model: str = DEFAULT_MODEL,
-) -> tuple[RAGAnswer, list[RetrievalResult], RetrievalRoute]:
-    chunks, index, metadata = load_retrieval_artifacts(limit=limit)
-    bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid", "adaptive"} else None
+    chunks,
+    index,
+    metadata: dict,
+    method: str,
+    top_k: int,
+    bm25_index,
+    candidate_k: int,
+    neighbor_window: int,
+    use_evidence_grader: bool,
+    return_evidence_grade: bool,
+) -> tuple[list[RetrievalResult], RetrievalRoute, EvidenceGrade | None]:
     results, route = retrieve_with_route(
         question,
         chunks=chunks,
@@ -185,6 +193,68 @@ def run_rag(
         bm25_index=bm25_index,
         candidate_k=candidate_k,
         neighbor_window=neighbor_window,
+    )
+    evidence_grade = (
+        grade_retrieved_evidence(question, results)
+        if use_evidence_grader or return_evidence_grade
+        else None
+    )
+    if not route.related_to_index and evidence_grade is None:
+        evidence_grade = grade_retrieved_evidence(question, results)
+
+    if (
+        use_evidence_grader
+        and route.related_to_index
+        and evidence_grade is not None
+        and evidence_grade.needs_retry
+    ):
+        corrected_results, corrected_route = retrieve_with_route(
+            question,
+            chunks=chunks,
+            index=index,
+            metadata=metadata,
+            top_k=max(top_k, CORRECTIVE_TOP_K),
+            method=CORRECTIVE_METHOD,
+            bm25_index=bm25_index,
+            candidate_k=max(candidate_k, CORRECTIVE_CANDIDATE_K),
+            neighbor_window=max(neighbor_window, CORRECTIVE_NEIGHBOR_WINDOW),
+        )
+        corrected_grade = grade_retrieved_evidence(question, corrected_results)
+
+        if corrected_grade.confidence >= evidence_grade.confidence:
+            return corrected_results, corrected_route, corrected_grade
+
+    return results, route, evidence_grade
+
+
+def run_rag(
+    question: str,
+    method: str = "dense",
+    top_k: int = DEFAULT_TOP_K,
+    candidate_k: int = 10,
+    neighbor_window: int = 0,
+    limit: int = DEFAULT_LIMIT,
+    model: str = DEFAULT_MODEL,
+    use_evidence_grader: bool = False,
+    return_evidence_grade: bool = False,
+) -> tuple[RAGAnswer, list[RetrievalResult], RetrievalRoute, EvidenceGrade | None]:
+    chunks, index, metadata = load_retrieval_artifacts(limit=limit)
+    bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid", "adaptive"} else None
+    if use_evidence_grader and bm25_index is None:
+        bm25_index = build_bm25_index(chunks)
+
+    results, route, evidence_grade = retrieve_and_grade(
+        question,
+        chunks,
+        index,
+        metadata,
+        method=method,
+        top_k=top_k,
+        bm25_index=bm25_index,
+        candidate_k=candidate_k,
+        neighbor_window=neighbor_window,
+        use_evidence_grader=use_evidence_grader,
+        return_evidence_grade=return_evidence_grade,
     )
 
     if not route.related_to_index:
@@ -197,10 +267,11 @@ def run_rag(
             ),
             results,
             route,
+            evidence_grade or grade_retrieved_evidence(question, results),
         )
 
     answer = generate_answer(question, results, model=model)
-    return answer, results, route
+    return answer, results, route, evidence_grade
 
 
 def print_answer(answer: RAGAnswer) -> None:
@@ -218,6 +289,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--show-evidence", action="store_true")
     parser.add_argument("--show-route", action="store_true")
+    parser.add_argument("--use-evidence-grader", action="store_true")
+    parser.add_argument("--show-grade", action="store_true")
     return parser.parse_args()
 
 
@@ -225,7 +298,7 @@ def main() -> None:
     load_dotenv()
     args = parse_args()
 
-    answer, results, route = run_rag(
+    answer, results, route, evidence_grade = run_rag(
         args.query,
         method=args.method,
         top_k=args.top_k,
@@ -233,6 +306,8 @@ def main() -> None:
         neighbor_window=args.neighbor_window,
         limit=args.limit,
         model=args.model,
+        use_evidence_grader=args.use_evidence_grader,
+        return_evidence_grade=args.show_grade,
     )
 
     if args.show_route:
@@ -243,6 +318,11 @@ def main() -> None:
         print(f"route_related_to_index: {route.related_to_index}")
         print(f"route_signals: {route.signals}")
         print(f"route_reason: {route.reason}")
+        print()
+
+    if args.show_grade and evidence_grade is not None:
+        print("evidence_grade:")
+        print(json.dumps(asdict(evidence_grade), indent=2))
         print()
 
     print_answer(answer)
