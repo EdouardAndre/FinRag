@@ -18,6 +18,7 @@ each stage measurable enough that improvements can be tested instead of guessed.
 - Embeds chunk content with Mistral embeddings.
 - Stores vectors in a FAISS index.
 - Supports dense, BM25, hybrid, and adaptive retrieval.
+- Can rerank larger candidate sets with a lightweight heuristic reranker.
 - Optionally expands retrieved chunks with neighboring rows/paragraphs.
 - Grades whether retrieved evidence appears sufficient.
 - Performs corrective retrieval using query rewriting, hybrid retrieval, larger `top_k`, and neighbors.
@@ -48,9 +49,13 @@ flowchart TD
     FAISS --> CAND[Retrieved chunk candidates]
     BM25 --> CAND
 
-    CAND --> N{Neighbor window?}
-    N -->|Yes| EXPAND[Add nearby table/text chunks]
-    N -->|No| CONTEXT[Retrieved context]
+    CAND --> RR{Rerank enabled?}
+    RR -->|Yes| RERANK[Heuristic candidate reranker]
+    RR -->|No| KEEP[Keep retriever order]
+    RERANK --> NW{Neighbor window?}
+    KEEP --> NW
+    NW -->|Yes| EXPAND[Add nearby table/text chunks]
+    NW -->|No| CONTEXT[Retrieved context]
     EXPAND --> CONTEXT
 
     CONTEXT --> G[Evidence grader]
@@ -86,7 +91,8 @@ flowchart TD
 │   ├── evaluate_answers.py       # End-to-end answer evaluation
 │   ├── evaluate_evidence_grader.py
 │   ├── evaluate_retrieval.py
-│   └── error_analysis.py
+│   ├── error_analysis.py
+│   └── run_global_experiment.py  # Reproducible multi-method experiment runner
 ├── results/                      # Evaluation CSV outputs
 ├── src/
 │   ├── calculation.py            # Deterministic arithmetic execution
@@ -96,9 +102,11 @@ flowchart TD
 │   ├── grade_documents.py        # Evidence sufficiency grading
 │   ├── load_data.py              # FinQA loading/parsing
 │   ├── query_rewrite.py          # LLM/heuristic query rewriting
+│   ├── rerank.py                 # Lightweight candidate reranking
 │   ├── retrieve.py               # Dense, BM25, hybrid, adaptive retrieval
 │   ├── router.py                 # Adaptive retrieval router
 │   └── schemas.py                # Shared data models
+├── app.py                        # Streamlit interface
 └── README.md
 ```
 
@@ -172,7 +180,9 @@ Dense retrieval:
 .venv/bin/python src/retrieve.py \
   --query "what is the average payment volume per transaction for american express?" \
   --method dense \
-  --top-k 5
+  --top-k 5 \
+  --rerank \
+  --candidate-k 30
 ```
 
 Show the adaptive route decision:
@@ -216,6 +226,12 @@ right chunks?"
   - out-of-scope questions abstain;
   - otherwise, dense retrieval is used.
 
+`--rerank`
+: Retrieves a larger candidate set, scores candidates with lightweight features, then keeps the best
+  `top_k`. The reranker considers original rank, retrieval score, question/content term overlap,
+  year support, number support, table relevance, and document/example cohesion. It is intentionally
+  local and cheap: no extra LLM calls are required.
+
 ## Corrective Retrieval
 
 When evidence grading is enabled and the grader marks retrieved evidence as weak, the pipeline can
@@ -238,6 +254,8 @@ Run the end-to-end RAG pipeline:
   --query "what is the average payment volume per transaction for american express?" \
   --method dense \
   --top-k 10 \
+  --candidate-k 30 \
+  --rerank \
   --show-route \
   --show-evidence
 ```
@@ -249,6 +267,7 @@ Use adaptive retrieval plus evidence grading:
   --query "what was the percentage cumulative total return for citi common stock?" \
   --method adaptive \
   --use-evidence-grader \
+  --rerank \
   --show-grade
 ```
 
@@ -311,6 +330,8 @@ Global retrieval:
   --method dense \
   --limit 100 \
   --max-k 10 \
+  --candidate-k 30 \
+  --rerank \
   --scope global
 ```
 
@@ -348,6 +369,8 @@ Global end-to-end evaluation:
   --method dense \
   --limit 20 \
   --top-k 10 \
+  --candidate-k 30 \
+  --rerank \
   --scope global \
   --predictions-path results/dense_global_answers.csv
 ```
@@ -359,6 +382,8 @@ Example-scoped diagnostic evaluation:
   --method dense \
   --limit 20 \
   --top-k 10 \
+  --candidate-k 30 \
+  --rerank \
   --scope example \
   --predictions-path results/dense_example_structured_calculation_answers.csv
 ```
@@ -410,9 +435,65 @@ Error categories include:
 - `calculation_or_generation_error`
 - `pipeline_error`
 
+### Global Experiment Runner
+
+Run a reproducible comparison across dense, BM25, hybrid, and adaptive retrieval:
+
+```bash
+.venv/bin/python evaluation/run_global_experiment.py \
+  --skip-index \
+  --eval-limit 100 \
+  --answer-limit 20 \
+  --max-k 10 \
+  --candidate-k 30 \
+  --include-rerank \
+  --run-answers
+```
+
+To rebuild a larger index first:
+
+```bash
+.venv/bin/python evaluation/run_global_experiment.py \
+  --index-limit 883 \
+  --eval-limit 883 \
+  --answer-limit 100 \
+  --max-k 10 \
+  --candidate-k 30 \
+  --include-rerank \
+  --run-answers
+```
+
+The runner writes:
+
+- `results/global_experiment/summary.csv`
+- `results/global_experiment/manifest.json`
+
+The larger command uses API calls for embedding and answer generation. Start with smaller limits if
+you want to control cost.
+
+## Interface
+
+Run the Streamlit interface:
+
+```bash
+streamlit run app.py
+```
+
+The app lets you enter a question and inspect:
+
+- final answer;
+- citations;
+- calculation trace;
+- executed answer;
+- retrieval route;
+- evidence grade;
+- retrieved chunks.
+
 ## Current Findings
 
-Recent smoke tests showed:
+### Diagnostic Scoped Retrieval
+
+An earlier scoped diagnostic showed:
 
 ```text
 dense retrieval, limit 10, top_k 10
@@ -423,7 +504,9 @@ example recall@10: 0.9500
 This suggests the system retrieves evidence much better once it is searching inside the correct
 FinQA example. In other words, global document/example selection is a real bottleneck.
 
-Recent answer evaluation with example-scoped dense retrieval showed:
+### Structured Calculation
+
+Example-scoped answer evaluation showed:
 
 ```text
 before structured calculation:
@@ -439,8 +522,55 @@ error_rate: 0.0000
 ```
 
 This suggests deterministic execution helps, but the model still sometimes chooses the wrong operands
-or operation. The next major gains should come from better evidence selection and program generation,
-not just more retrieval volume.
+or operation.
+
+### Global Reranking Experiment
+
+The global experiment runner compared dense, BM25, hybrid, and adaptive retrieval with and without
+the heuristic reranker:
+
+```bash
+.venv/bin/python evaluation/run_global_experiment.py \
+  --skip-index \
+  --eval-limit 100 \
+  --answer-limit 20 \
+  --max-k 10 \
+  --candidate-k 30 \
+  --include-rerank \
+  --run-answers
+```
+
+Retrieval improved across all methods:
+
+```text
+method      baseline recall@10   reranked recall@10
+dense       0.8258               0.8692
+bm25        0.7417               0.7908
+hybrid      0.7908               0.8358
+adaptive    0.7767               0.8325
+```
+
+Final answer quality improved most with adaptive retrieval plus reranking:
+
+```text
+configuration       numerical_match   insufficient_evidence_rate   execution_success_rate
+dense baseline      0.4737            0.3684                       0.5263
+dense reranked      0.5263            0.3158                       0.6316
+hybrid baseline     0.5263            0.3684                       0.5263
+adaptive baseline   0.5000            0.3500                       0.5500
+adaptive reranked   0.6111            0.1667                       0.7222
+```
+
+The main caveat is stability: `adaptive_reranked_answers` completed 18/20 examples, with
+`error_rate: 0.1000`. The best-performing path is therefore promising, but the next engineering step
+is to inspect and fix those failures before treating it as the default production path.
+
+The current engineering narrative is:
+
+```text
+measure -> diagnose retrieval and calculation bottlenecks -> add reranking and deterministic
+calculation execution -> remeasure -> improve numerical accuracy and reduce abstention
+```
 
 ## Development Notes
 
@@ -455,10 +585,11 @@ not just more retrieval volume.
 
 ## Recommended Next Improvements
 
-1. Add a document/page selection stage before chunk retrieval.
-2. Add a reranker over 20-30 retrieved candidates, then pass only 5-8 high-quality chunks to generation.
-3. Improve program generation by validating that operands appear in cited chunks.
-4. Add support for FinQA table aggregate programs such as `table_average`, `table_sum`, `table_min`,
+1. Inspect and fix the two `adaptive_reranked_answers` pipeline failures.
+2. Add a document/page selection stage before chunk retrieval.
+3. Replace the current heuristic reranker with a stronger cross-encoder or LLM reranker.
+4. Improve program generation by validating that operands appear in cited chunks.
+5. Add support for FinQA table aggregate programs such as `table_average`, `table_sum`, `table_min`,
    and `table_max`.
-5. Calibrate the evidence grader against strict gold evidence labels.
-6. Evaluate on larger indexed subsets after rebuilding the full required index.
+6. Calibrate the evidence grader against strict gold evidence labels.
+7. Evaluate on larger indexed subsets after rebuilding the full required index.

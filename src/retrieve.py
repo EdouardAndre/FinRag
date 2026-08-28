@@ -10,10 +10,12 @@ from rank_bm25 import BM25Okapi
 
 try:
     from .embed import ensure_chunks, create_mistral_client, normalize_vectors
+    from .rerank import rerank_results
     from .router import SUPPORTED_RETRIEVAL_METHODS, RetrievalRoute, route_question
     from .schemas import Chunk, RetrievalResult
 except ImportError:
     from embed import ensure_chunks, create_mistral_client, normalize_vectors
+    from rerank import rerank_results
     from router import SUPPORTED_RETRIEVAL_METHODS, RetrievalRoute, route_question
     from schemas import Chunk, RetrievalResult
 
@@ -349,16 +351,21 @@ def retrieve(
     candidate_k: int = 10,
     neighbor_window: int = DEFAULT_NEIGHBOR_WINDOW,
     allowed_example_id: str | None = None,
+    rerank: bool = False,
 ) -> list[RetrievalResult]:
+    seed_k = max(candidate_k, top_k) if rerank else top_k
+
     if method == "dense":
         results = retrieve_dense(
             query,
             chunks=chunks,
             index=index,
             metadata=metadata,
-            top_k=top_k,
+            top_k=seed_k,
             allowed_example_id=allowed_example_id,
         )
+        if rerank:
+            results = rerank_results(query, results, top_k=top_k)
         return expand_with_neighbors(results, chunks, neighbor_window=neighbor_window)
 
     if method == "bm25":
@@ -368,7 +375,9 @@ def retrieve(
             _, bm25_chunks = scoped_chunks(chunks, allowed_example_id)
             resolved_bm25_index = build_bm25_index(bm25_chunks)
 
-        results = search_bm25(query, resolved_bm25_index, bm25_chunks, top_k=top_k)
+        results = search_bm25(query, resolved_bm25_index, bm25_chunks, top_k=seed_k)
+        if rerank:
+            results = rerank_results(query, results, top_k=top_k)
         return expand_with_neighbors(results, chunks, neighbor_window=neighbor_window)
 
     if method == "hybrid":
@@ -379,10 +388,12 @@ def retrieve(
             index=index,
             metadata=metadata,
             bm25_index=resolved_bm25_index,
-            top_k=top_k,
-            candidate_k=candidate_k,
+            top_k=seed_k,
+            candidate_k=max(candidate_k, seed_k),
             allowed_example_id=allowed_example_id,
         )
+        if rerank:
+            results = rerank_results(query, results, top_k=top_k)
         return expand_with_neighbors(results, chunks, neighbor_window=neighbor_window)
 
     raise ValueError(f"Unsupported retrieval method: {method}")
@@ -423,6 +434,7 @@ def retrieve_with_route(
     candidate_k: int = 10,
     neighbor_window: int = DEFAULT_NEIGHBOR_WINDOW,
     allowed_example_id: str | None = None,
+    rerank: bool = False,
 ) -> tuple[list[RetrievalResult], RetrievalRoute]:
     route = resolve_retrieval_route(
         query=query,
@@ -446,6 +458,7 @@ def retrieve_with_route(
         candidate_k=route.candidate_k,
         neighbor_window=route.neighbor_window,
         allowed_example_id=allowed_example_id,
+        rerank=rerank,
     )
     return results, route
 
@@ -473,6 +486,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--method", choices=["dense", "bm25", "hybrid", "adaptive"], default="dense")
     parser.add_argument("--allowed-example-id")
+    parser.add_argument("--rerank", action="store_true")
     parser.add_argument("--show-route", action="store_true")
     return parser.parse_args()
 
@@ -496,6 +510,7 @@ def main() -> None:
         candidate_k=args.candidate_k,
         neighbor_window=args.neighbor_window,
         allowed_example_id=args.allowed_example_id,
+        rerank=args.rerank,
     )
     if args.show_route:
         print(f"route_method: {route.method}")

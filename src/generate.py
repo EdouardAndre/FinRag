@@ -305,6 +305,7 @@ def retrieve_and_grade(
     return_evidence_grade: bool,
     rewrite_model: str,
     allowed_example_id: str | None = None,
+    rerank: bool = False,
 ) -> tuple[list[RetrievalResult], RetrievalRoute, EvidenceGrade | None]:
     results, route = retrieve_with_route(
         question,
@@ -317,6 +318,7 @@ def retrieve_and_grade(
         candidate_k=candidate_k,
         neighbor_window=neighbor_window,
         allowed_example_id=allowed_example_id,
+        rerank=rerank,
     )
     evidence_grade = (
         grade_retrieved_evidence(question, results)
@@ -344,6 +346,7 @@ def retrieve_and_grade(
             candidate_k=max(candidate_k, CORRECTIVE_CANDIDATE_K),
             neighbor_window=max(neighbor_window, CORRECTIVE_NEIGHBOR_WINDOW),
             allowed_example_id=allowed_example_id,
+            rerank=True,
         )
         merged_results = merge_retrieval_results(
             primary_results=results,
@@ -369,6 +372,7 @@ def run_rag(
     use_evidence_grader: bool = False,
     return_evidence_grade: bool = False,
     allowed_example_id: str | None = None,
+    rerank: bool = False,
 ) -> tuple[RAGAnswer, list[RetrievalResult], RetrievalRoute, EvidenceGrade | None]:
     chunks, index, metadata = load_retrieval_artifacts(limit=limit)
     bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid", "adaptive"} else None
@@ -389,6 +393,7 @@ def run_rag(
         return_evidence_grade=return_evidence_grade,
         rewrite_model=model,
         allowed_example_id=allowed_example_id,
+        rerank=rerank,
     )
 
     if not route.related_to_index:
@@ -425,6 +430,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-route", action="store_true")
     parser.add_argument("--use-evidence-grader", action="store_true")
     parser.add_argument("--show-grade", action="store_true")
+    parser.add_argument("--rerank", action="store_true")
     return parser.parse_args()
 
 
@@ -442,6 +448,7 @@ def main() -> None:
         model=args.model,
         use_evidence_grader=args.use_evidence_grader,
         return_evidence_grade=args.show_grade,
+        rerank=args.rerank,
     )
 
     if args.show_route:

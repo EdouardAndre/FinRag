@@ -299,6 +299,7 @@ def evaluate_answers(
     model: str,
     use_evidence_grader: bool,
     scope: str,
+    rerank: bool,
 ) -> list[AnswerEvaluation]:
     chunks, index, metadata = load_retrieval_artifacts(limit=len(examples))
     bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid", "adaptive"} else None
@@ -324,6 +325,7 @@ def evaluate_answers(
                 return_evidence_grade=use_evidence_grader,
                 rewrite_model=model,
                 allowed_example_id=example.example_id if scope == "example" else None,
+                rerank=rerank,
             )
             if not route.related_to_index:
                 answer = RAGAnswer(
@@ -374,6 +376,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictions-path", default=str(DEFAULT_RESULTS_PATH))
     parser.add_argument("--use-evidence-grader", action="store_true")
     parser.add_argument("--scope", choices=sorted(RETRIEVAL_SCOPES), default="global")
+    parser.add_argument("--rerank", action="store_true")
     return parser.parse_args()
 
 
@@ -391,8 +394,14 @@ def main() -> None:
         model=args.model,
         use_evidence_grader=args.use_evidence_grader,
         scope=args.scope,
+        rerank=args.rerank,
     )
-    metrics = {"method": args.method, "scope": args.scope, **summarize_evaluations(evaluations)}
+    metrics = {
+        "method": args.method,
+        "scope": args.scope,
+        "rerank": str(args.rerank),
+        **summarize_evaluations(evaluations),
+    }
     print_metrics(metrics)
     save_predictions(evaluations, args.predictions_path)
     print(f"predictions saved to: {args.predictions_path}")

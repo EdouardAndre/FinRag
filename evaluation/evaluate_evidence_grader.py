@@ -178,6 +178,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--candidate-k", type=int, default=20)
     parser.add_argument("--neighbor-window", type=int, default=0)
+    parser.add_argument("--rerank", action="store_true")
     parser.add_argument("--results-path", default=str(DEFAULT_RESULTS_PATH))
     return parser.parse_args()
 
@@ -204,10 +205,16 @@ def main() -> None:
             candidate_k=max(args.candidate_k, args.top_k),
             neighbor_window=args.neighbor_window,
             allowed_example_id=example.example_id if args.scope == "example" else None,
+            rerank=args.rerank,
         )
         evaluations.append(evaluate_example(example, results))
 
-    metrics = {"method": args.method, "scope": args.scope, **summarize_evaluations(evaluations)}
+    metrics = {
+        "method": args.method,
+        "scope": args.scope,
+        "rerank": str(args.rerank),
+        **summarize_evaluations(evaluations),
+    }
     print_metrics(metrics)
     save_evaluations(evaluations, args.results_path)
     print(f"grader evaluations saved to: {args.results_path}")

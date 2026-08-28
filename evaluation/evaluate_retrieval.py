@@ -87,6 +87,7 @@ def evaluate_example(
     candidate_k: int,
     neighbor_window: int,
     scope: str,
+    rerank: bool,
 ) -> RetrievalEvaluation:
     allowed_example_id = example.example_id if scope == "example" else None
     results, route = retrieve_with_route(
@@ -100,6 +101,7 @@ def evaluate_example(
         candidate_k=candidate_k,
         neighbor_window=neighbor_window,
         allowed_example_id=allowed_example_id,
+        rerank=rerank,
     )
     if not route.related_to_index:
         results = []
@@ -208,6 +210,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neighbor-window", type=int, default=0)
     parser.add_argument("--method", choices=["dense", "bm25", "hybrid", "adaptive"], default="dense")
     parser.add_argument("--scope", choices=sorted(RETRIEVAL_SCOPES), default="global")
+    parser.add_argument("--rerank", action="store_true")
     parser.add_argument("--failure-cutoff", type=int, default=5)
     parser.add_argument("--failures-path")
     return parser.parse_args()
@@ -234,12 +237,13 @@ def main() -> None:
             candidate_k=candidate_k,
             neighbor_window=args.neighbor_window,
             scope=args.scope,
+            rerank=args.rerank,
         )
         for example in examples
     ]
 
     metrics = summarize_evaluations(evaluations)
-    metrics = {"method": args.method, "scope": args.scope, **metrics}
+    metrics = {"method": args.method, "scope": args.scope, "rerank": str(args.rerank), **metrics}
     print_metrics(metrics)
 
     failures_path = (
