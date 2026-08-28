@@ -51,8 +51,19 @@ class Citation:
 
 
 @dataclass(frozen=True)
+class CalculationStep:
+    operation: str
+    arguments: list[Any]
+
+
+@dataclass(frozen=True)
 class RAGAnswer:
     answer: str
     citations: list[Citation]
     calculation: str | None
     insufficient_evidence: bool
+    calculation_steps: list[CalculationStep] = field(default_factory=list)
+    answer_unit: str | None = None
+    answer_scale: str | None = None
+    executed_answer: str | None = None
+    execution_error: str | None = None

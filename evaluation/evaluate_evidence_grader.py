@@ -25,6 +25,7 @@ DEFAULT_DATASET_PATH = Path("data/FinQA/dataset/dev.json")
 DEFAULT_RESULTS_PATH = Path("results/evidence_grader.csv")
 DEFAULT_LIMIT = 100
 DEFAULT_TOP_K = 10
+RETRIEVAL_SCOPES = {"global", "example"}
 
 
 @dataclass(frozen=True)
@@ -38,20 +39,34 @@ class EvidenceGraderEvaluation:
     has_all_gold_evidence: bool
 
 
-def source_ids_from_results(results: list[RetrievalResult]) -> list[str]:
-    source_ids = []
+def evidence_id(example_id: str, source_id: str) -> str:
+    return f"{example_id}::{source_id}"
+
+
+def evidence_ids_from_results(results: list[RetrievalResult]) -> list[str]:
+    evidence_ids = []
     for result in results:
-        source_ids.extend(result.chunk.source_ids)
-    return source_ids
+        evidence_ids.extend(
+            evidence_id(result.chunk.example_id, source_id)
+            for source_id in result.chunk.source_ids
+        )
+    return evidence_ids
+
+
+def gold_evidence_ids(example: FinancialExample) -> set[str]:
+    return {
+        evidence_id(example.example_id, source_id)
+        for source_id in example.gold_evidence.keys()
+    }
 
 
 def evaluate_example(
     example: FinancialExample,
     results: list[RetrievalResult],
 ) -> EvidenceGraderEvaluation:
-    retrieved_ids = source_ids_from_results(results)
+    retrieved_ids = evidence_ids_from_results(results)
     retrieved_id_set = set(retrieved_ids)
-    gold_ids = set(example.gold_evidence.keys())
+    gold_ids = gold_evidence_ids(example)
     grade = grade_retrieved_evidence(example.question, results)
 
     return EvidenceGraderEvaluation(
@@ -159,6 +174,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", default=str(DEFAULT_DATASET_PATH))
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--method", choices=["dense", "bm25", "hybrid", "adaptive"], default="dense")
+    parser.add_argument("--scope", choices=sorted(RETRIEVAL_SCOPES), default="global")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--candidate-k", type=int, default=20)
     parser.add_argument("--neighbor-window", type=int, default=0)
@@ -187,10 +203,11 @@ def main() -> None:
             bm25_index=bm25_index,
             candidate_k=max(args.candidate_k, args.top_k),
             neighbor_window=args.neighbor_window,
+            allowed_example_id=example.example_id if args.scope == "example" else None,
         )
         evaluations.append(evaluate_example(example, results))
 
-    metrics = {"method": args.method, **summarize_evaluations(evaluations)}
+    metrics = {"method": args.method, "scope": args.scope, **summarize_evaluations(evaluations)}
     print_metrics(metrics)
     save_evaluations(evaluations, args.results_path)
     print(f"grader evaluations saved to: {args.results_path}")

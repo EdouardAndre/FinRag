@@ -1,7 +1,8 @@
 import argparse
 import csv
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,6 +31,7 @@ DEFAULT_LIMIT = 20
 DEFAULT_TOP_K = 5
 DEFAULT_MODEL = "mistral-small-latest"
 NUMERIC_TOLERANCE = 1e-3
+RETRIEVAL_SCOPES = {"global", "example"}
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,12 @@ class AnswerEvaluation:
     numerical_match: bool
     citation_valid: bool
     insufficient_evidence: bool
+    calculation: str | None
+    calculation_steps: str
+    answer_unit: str | None
+    answer_scale: str | None
+    executed_answer: str | None
+    execution_error: str | None
     error: str | None
     retrieved_chunk_ids: list[str]
     cited_chunk_ids: list[str]
@@ -104,6 +112,12 @@ def numerical_match(
 
 
 def citations_are_valid(answer: RAGAnswer, results: list[RetrievalResult]) -> bool:
+    if answer.insufficient_evidence:
+        return not answer.citations
+
+    if not answer.citations:
+        return False
+
     retrieved_chunk_ids = {result.chunk.chunk_id for result in results}
     return all(citation.chunk_id in retrieved_chunk_ids for citation in answer.citations)
 
@@ -129,6 +143,12 @@ def evaluate_answer(
         ),
         citation_valid=citations_are_valid(answer, results),
         insufficient_evidence=answer.insufficient_evidence,
+        calculation=answer.calculation,
+        calculation_steps=serialize_calculation_steps(answer),
+        answer_unit=answer.answer_unit,
+        answer_scale=answer.answer_scale,
+        executed_answer=answer.executed_answer,
+        execution_error=answer.execution_error,
         error=None,
         retrieved_chunk_ids=[result.chunk.chunk_id for result in results],
         cited_chunk_ids=[citation.chunk_id for citation in answer.citations],
@@ -148,6 +168,12 @@ def failed_evaluation(example: FinancialExample, error: Exception) -> AnswerEval
         numerical_match=False,
         citation_valid=False,
         insufficient_evidence=False,
+        calculation=None,
+        calculation_steps="",
+        answer_unit=None,
+        answer_scale=None,
+        executed_answer=None,
+        execution_error=None,
         error=str(error),
         retrieved_chunk_ids=[],
         cited_chunk_ids=[],
@@ -173,6 +199,12 @@ def summarize_evaluations(evaluations: list[AnswerEvaluation]) -> dict[str, floa
         "exact_match": average([evaluation.exact_match for evaluation in completed]),
         "numerical_match": average([evaluation.numerical_match for evaluation in completed]),
         "citation_validity": average([evaluation.citation_valid for evaluation in completed]),
+        "execution_success_rate": average(
+            [evaluation.executed_answer is not None for evaluation in completed]
+        ),
+        "execution_error_rate": average(
+            [evaluation.execution_error is not None for evaluation in completed]
+        ),
         "insufficient_evidence_rate": average(
             [evaluation.insufficient_evidence for evaluation in completed]
         ),
@@ -196,6 +228,12 @@ def save_predictions(evaluations: list[AnswerEvaluation], path: str | Path) -> N
                 "numerical_match",
                 "citation_valid",
                 "insufficient_evidence",
+                "calculation",
+                "calculation_steps",
+                "answer_unit",
+                "answer_scale",
+                "executed_answer",
+                "execution_error",
                 "error",
                 "retrieved_chunk_ids",
                 "cited_chunk_ids",
@@ -217,6 +255,12 @@ def save_predictions(evaluations: list[AnswerEvaluation], path: str | Path) -> N
                     "numerical_match": evaluation.numerical_match,
                     "citation_valid": evaluation.citation_valid,
                     "insufficient_evidence": evaluation.insufficient_evidence,
+                    "calculation": evaluation.calculation or "",
+                    "calculation_steps": evaluation.calculation_steps,
+                    "answer_unit": evaluation.answer_unit or "",
+                    "answer_scale": evaluation.answer_scale or "",
+                    "executed_answer": evaluation.executed_answer or "",
+                    "execution_error": evaluation.execution_error or "",
                     "error": evaluation.error or "",
                     "retrieved_chunk_ids": " ".join(evaluation.retrieved_chunk_ids),
                     "cited_chunk_ids": " ".join(evaluation.cited_chunk_ids),
@@ -225,6 +269,13 @@ def save_predictions(evaluations: list[AnswerEvaluation], path: str | Path) -> N
                     "evidence_grade_reason": evaluation.evidence_grade_reason or "",
                 }
             )
+
+
+def serialize_calculation_steps(answer: RAGAnswer) -> str:
+    if not answer.calculation_steps:
+        return ""
+
+    return json.dumps([asdict(step) for step in answer.calculation_steps])
 
 
 def print_metrics(metrics: dict[str, float | str]) -> None:
@@ -247,6 +298,7 @@ def evaluate_answers(
     neighbor_window: int,
     model: str,
     use_evidence_grader: bool,
+    scope: str,
 ) -> list[AnswerEvaluation]:
     chunks, index, metadata = load_retrieval_artifacts(limit=len(examples))
     bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid", "adaptive"} else None
@@ -270,6 +322,8 @@ def evaluate_answers(
                 neighbor_window=neighbor_window,
                 use_evidence_grader=use_evidence_grader,
                 return_evidence_grade=use_evidence_grader,
+                rewrite_model=model,
+                allowed_example_id=example.example_id if scope == "example" else None,
             )
             if not route.related_to_index:
                 answer = RAGAnswer(
@@ -319,6 +373,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--predictions-path", default=str(DEFAULT_RESULTS_PATH))
     parser.add_argument("--use-evidence-grader", action="store_true")
+    parser.add_argument("--scope", choices=sorted(RETRIEVAL_SCOPES), default="global")
     return parser.parse_args()
 
 
@@ -335,8 +390,9 @@ def main() -> None:
         neighbor_window=args.neighbor_window,
         model=args.model,
         use_evidence_grader=args.use_evidence_grader,
+        scope=args.scope,
     )
-    metrics = {"method": args.method, **summarize_evaluations(evaluations)}
+    metrics = {"method": args.method, "scope": args.scope, **summarize_evaluations(evaluations)}
     print_metrics(metrics)
     save_predictions(evaluations, args.predictions_path)
     print(f"predictions saved to: {args.predictions_path}")

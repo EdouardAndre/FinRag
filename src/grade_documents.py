@@ -73,7 +73,8 @@ def grade_retrieved_evidence(
         )
 
     question_signals = detect_question_signals(question)
-    evidence_text = "\n".join(result.chunk.content for result in results)
+    cohesive_results = dominant_example_results(results)
+    evidence_text = "\n".join(result.chunk.content for result in cohesive_results)
     matched_signals = []
     missing_signals = []
     score = 0.0
@@ -96,7 +97,7 @@ def grade_retrieved_evidence(
     else:
         missing_signals.append("numeric_support")
 
-    if table_evidence_is_supported(question_signals, results):
+    if table_evidence_is_supported(question_signals, cohesive_results):
         matched_signals.append("table_support")
         score += 0.15
     else:
@@ -126,6 +127,17 @@ def grade_retrieved_evidence(
         matched_signals=matched_signals,
         missing_signals=missing_signals,
     )
+
+
+def dominant_example_results(results: list[RetrievalResult]) -> list[RetrievalResult]:
+    top_results = results[: min(5, len(results))]
+    example_counts = Counter(result.chunk.example_id for result in top_results)
+    dominant_example_id, _ = example_counts.most_common(1)[0]
+    return [
+        result
+        for result in results
+        if result.chunk.example_id == dominant_example_id
+    ]
 
 
 def has_metric_overlap(question: str, evidence_text: str) -> bool:

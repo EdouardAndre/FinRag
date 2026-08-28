@@ -110,6 +110,23 @@ def build_bm25_index(chunks: list[Chunk]) -> BM25Okapi:
     return BM25Okapi(tokenized_chunks)
 
 
+def scoped_chunks(
+    chunks: list[Chunk],
+    allowed_example_id: str | None = None,
+) -> tuple[list[int], list[Chunk]]:
+    if allowed_example_id is None:
+        return list(range(len(chunks))), chunks
+
+    original_indices = []
+    matching_chunks = []
+    for index, chunk in enumerate(chunks):
+        if chunk.example_id == allowed_example_id:
+            original_indices.append(index)
+            matching_chunks.append(chunk)
+
+    return original_indices, matching_chunks
+
+
 def search_bm25(
     query: str,
     bm25_index: BM25Okapi,
@@ -149,6 +166,24 @@ def build_retrieval_results(
         )
 
     return results
+
+
+def build_scoped_dense_index(
+    index: faiss.Index,
+    original_indices: list[int],
+    metric: str,
+) -> faiss.Index:
+    if metric == "cosine":
+        scoped_index = faiss.IndexFlatIP(index.d)
+    else:
+        scoped_index = faiss.IndexFlatL2(index.d)
+
+    vectors = np.array(
+        [index.reconstruct(original_index) for original_index in original_indices],
+        dtype=np.float32,
+    )
+    scoped_index.add(vectors)
+    return scoped_index
 
 
 def neighbor_key(chunk: Chunk) -> tuple[str, str, int] | None:
@@ -216,12 +251,28 @@ def retrieve_dense(
     index: faiss.Index,
     metadata: dict,
     top_k: int = DEFAULT_TOP_K,
+    allowed_example_id: str | None = None,
 ) -> list[RetrievalResult]:
+    metric = metadata.get("metric", "cosine")
     query_vector = embed_query(
         query,
         model=metadata.get("model", DEFAULT_MODEL),
-        metric=metadata.get("metric", "cosine"),
+        metric=metric,
     )
+
+    if allowed_example_id is not None:
+        original_indices, matching_chunks = scoped_chunks(chunks, allowed_example_id)
+        if not matching_chunks:
+            return []
+
+        scoped_index = build_scoped_dense_index(index, original_indices, metric)
+        scores, indices = search_index(
+            scoped_index,
+            query_vector,
+            top_k=min(top_k, len(matching_chunks)),
+        )
+        return build_retrieval_results(scores, indices, matching_chunks)
+
     scores, indices = search_index(index, query_vector, top_k=top_k)
     return build_retrieval_results(scores, indices, chunks)
 
@@ -260,18 +311,28 @@ def retrieve_hybrid(
     bm25_index: BM25Okapi,
     top_k: int = DEFAULT_TOP_K,
     candidate_k: int = 10,
+    allowed_example_id: str | None = None,
 ) -> list[RetrievalResult]:
+    bm25_chunks = chunks
+    resolved_bm25_index = bm25_index
+    if allowed_example_id is not None:
+        _, bm25_chunks = scoped_chunks(chunks, allowed_example_id)
+        if not bm25_chunks:
+            return []
+        resolved_bm25_index = build_bm25_index(bm25_chunks)
+
     dense_results = retrieve_dense(
         query,
         chunks=chunks,
         index=index,
         metadata=metadata,
         top_k=candidate_k,
+        allowed_example_id=allowed_example_id,
     )
     bm25_results = search_bm25(
         query,
-        bm25_index=bm25_index,
-        chunks=chunks,
+        bm25_index=resolved_bm25_index,
+        chunks=bm25_chunks,
         top_k=candidate_k,
     )
     return reciprocal_rank_fusion([dense_results, bm25_results], top_k=top_k)
@@ -287,14 +348,27 @@ def retrieve(
     bm25_index: BM25Okapi | None = None,
     candidate_k: int = 10,
     neighbor_window: int = DEFAULT_NEIGHBOR_WINDOW,
+    allowed_example_id: str | None = None,
 ) -> list[RetrievalResult]:
     if method == "dense":
-        results = retrieve_dense(query, chunks=chunks, index=index, metadata=metadata, top_k=top_k)
+        results = retrieve_dense(
+            query,
+            chunks=chunks,
+            index=index,
+            metadata=metadata,
+            top_k=top_k,
+            allowed_example_id=allowed_example_id,
+        )
         return expand_with_neighbors(results, chunks, neighbor_window=neighbor_window)
 
     if method == "bm25":
+        bm25_chunks = chunks
         resolved_bm25_index = bm25_index or build_bm25_index(chunks)
-        results = search_bm25(query, resolved_bm25_index, chunks, top_k=top_k)
+        if allowed_example_id is not None:
+            _, bm25_chunks = scoped_chunks(chunks, allowed_example_id)
+            resolved_bm25_index = build_bm25_index(bm25_chunks)
+
+        results = search_bm25(query, resolved_bm25_index, bm25_chunks, top_k=top_k)
         return expand_with_neighbors(results, chunks, neighbor_window=neighbor_window)
 
     if method == "hybrid":
@@ -307,6 +381,7 @@ def retrieve(
             bm25_index=resolved_bm25_index,
             top_k=top_k,
             candidate_k=candidate_k,
+            allowed_example_id=allowed_example_id,
         )
         return expand_with_neighbors(results, chunks, neighbor_window=neighbor_window)
 
@@ -347,6 +422,7 @@ def retrieve_with_route(
     bm25_index: BM25Okapi | None = None,
     candidate_k: int = 10,
     neighbor_window: int = DEFAULT_NEIGHBOR_WINDOW,
+    allowed_example_id: str | None = None,
 ) -> tuple[list[RetrievalResult], RetrievalRoute]:
     route = resolve_retrieval_route(
         query=query,
@@ -369,6 +445,7 @@ def retrieve_with_route(
         bm25_index=bm25_index,
         candidate_k=route.candidate_k,
         neighbor_window=route.neighbor_window,
+        allowed_example_id=allowed_example_id,
     )
     return results, route
 
@@ -395,6 +472,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neighbor-window", type=int, default=DEFAULT_NEIGHBOR_WINDOW)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--method", choices=["dense", "bm25", "hybrid", "adaptive"], default="dense")
+    parser.add_argument("--allowed-example-id")
     parser.add_argument("--show-route", action="store_true")
     return parser.parse_args()
 
@@ -417,6 +495,7 @@ def main() -> None:
         bm25_index=bm25_index,
         candidate_k=args.candidate_k,
         neighbor_window=args.neighbor_window,
+        allowed_example_id=args.allowed_example_id,
     )
     if args.show_route:
         print(f"route_method: {route.method}")

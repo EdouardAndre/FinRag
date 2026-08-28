@@ -8,17 +8,21 @@ from typing import Any
 from dotenv import load_dotenv
 
 try:
+    from .calculation import execute_calculation_steps
     from .embed import create_mistral_client
     from .grade_documents import grade_retrieved_evidence
+    from .query_rewrite import rewrite_query_for_retrieval
     from .retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
     from .router import RetrievalRoute
-    from .schemas import Citation, EvidenceGrade, RAGAnswer, RetrievalResult
+    from .schemas import CalculationStep, Citation, EvidenceGrade, RAGAnswer, RetrievalResult
 except ImportError:
+    from calculation import execute_calculation_steps
     from embed import create_mistral_client
     from grade_documents import grade_retrieved_evidence
+    from query_rewrite import rewrite_query_for_retrieval
     from retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
     from router import RetrievalRoute
-    from schemas import Citation, EvidenceGrade, RAGAnswer, RetrievalResult
+    from schemas import CalculationStep, Citation, EvidenceGrade, RAGAnswer, RetrievalResult
 
 
 DEFAULT_MODEL = "mistral-small-latest"
@@ -34,7 +38,10 @@ SYSTEM_PROMPT = """You answer financial questions using only the supplied eviden
 
 Rules:
 - Cite every factual claim using a chunk_id from the evidence.
-- For numerical questions, show the calculation.
+- For numerical questions, return calculation_steps as executable arithmetic.
+- Use only these operations in calculation_steps: add, subtract, multiply, divide, exp, greater.
+- Use numeric operands from the evidence or previous step references like "#0".
+- Use answer_scale "auto" unless a specific display conversion is needed.
 - Do not use outside knowledge.
 - If the evidence is insufficient, set insufficient_evidence to true.
 - Never invent a citation.
@@ -80,6 +87,14 @@ Return JSON with exactly these fields:
     }}
   ],
   "calculation": "string or null",
+  "calculation_steps": [
+    {{
+      "operation": "add|subtract|multiply|divide|exp|greater",
+      "arguments": ["number or #step_reference", "number or #step_reference"]
+    }}
+  ],
+  "answer_unit": "raw|percent|percentage_points|million|billion|dollars|shares or null",
+  "answer_scale": "auto|raw|ratio_to_percent",
   "insufficient_evidence": true or false
 }}
 """
@@ -115,11 +130,95 @@ def parse_rag_answer(payload: dict[str, Any]) -> RAGAnswer:
     if calculation is not None:
         calculation = str(calculation)
 
+    calculation_steps = [
+        CalculationStep(
+            operation=str(step.get("operation", "")),
+            arguments=list(step.get("arguments", [])),
+        )
+        for step in payload.get("calculation_steps", [])
+        if isinstance(step, dict)
+    ]
+
     return RAGAnswer(
         answer=str(payload.get("answer", "")),
         citations=citations,
         calculation=calculation,
         insufficient_evidence=bool(payload.get("insufficient_evidence", False)),
+        calculation_steps=calculation_steps,
+        answer_unit=optional_string(payload.get("answer_unit")),
+        answer_scale=optional_string(payload.get("answer_scale")),
+    )
+
+
+def canonicalize_answer_citations(answer: RAGAnswer, results: list[RetrievalResult]) -> RAGAnswer:
+    chunk_ids = {result.chunk.chunk_id for result in results}
+    chunks_by_source_id: dict[str, list[str]] = {}
+    for result in results:
+        for source_id in result.chunk.source_ids:
+            chunks_by_source_id.setdefault(source_id, []).append(result.chunk.chunk_id)
+
+    citations = []
+    for citation in answer.citations:
+        chunk_id = citation.chunk_id
+        if chunk_id not in chunk_ids:
+            matching_chunk_ids = chunks_by_source_id.get(chunk_id, [])
+            if len(matching_chunk_ids) == 1:
+                chunk_id = matching_chunk_ids[0]
+
+        citations.append(Citation(chunk_id=chunk_id, quote=citation.quote))
+
+    return RAGAnswer(
+        answer=answer.answer,
+        citations=citations,
+        calculation=answer.calculation,
+        insufficient_evidence=answer.insufficient_evidence,
+        calculation_steps=answer.calculation_steps,
+        answer_unit=answer.answer_unit,
+        answer_scale=answer.answer_scale,
+        executed_answer=answer.executed_answer,
+        execution_error=answer.execution_error,
+    )
+
+
+def optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+
+    return str(value)
+
+
+def apply_deterministic_calculation(answer: RAGAnswer) -> RAGAnswer:
+    if answer.insufficient_evidence or not answer.calculation_steps:
+        return answer
+
+    execution = execute_calculation_steps(
+        answer.calculation_steps,
+        answer_unit=answer.answer_unit,
+        answer_scale=answer.answer_scale,
+    )
+    if execution.error is not None:
+        return RAGAnswer(
+            answer=answer.answer,
+            citations=answer.citations,
+            calculation=answer.calculation,
+            insufficient_evidence=answer.insufficient_evidence,
+            calculation_steps=answer.calculation_steps,
+            answer_unit=answer.answer_unit,
+            answer_scale=answer.answer_scale,
+            executed_answer=None,
+            execution_error=execution.error,
+        )
+
+    return RAGAnswer(
+        answer=execution.formatted_answer or answer.answer,
+        citations=answer.citations,
+        calculation=execution.trace or answer.calculation,
+        insufficient_evidence=answer.insufficient_evidence,
+        calculation_steps=answer.calculation_steps,
+        answer_unit=answer.answer_unit,
+        answer_scale=answer.answer_scale,
+        executed_answer=execution.formatted_answer,
+        execution_error=None,
     )
 
 
@@ -166,8 +265,30 @@ def generate_answer(
     content = response.choices[0].message.content
     payload = extract_json_object(content)
     answer = parse_rag_answer(payload)
+    answer = canonicalize_answer_citations(answer, results)
+    answer = apply_deterministic_calculation(answer)
     validate_citations(answer, results)
     return answer
+
+
+def merge_retrieval_results(
+    primary_results: list[RetrievalResult],
+    corrective_results: list[RetrievalResult],
+    top_k: int,
+) -> list[RetrievalResult]:
+    merged: dict[str, RetrievalResult] = {}
+
+    for result in primary_results + corrective_results:
+        chunk_id = result.chunk.chunk_id
+        existing = merged.get(chunk_id)
+        if existing is None or result.score > existing.score:
+            merged[chunk_id] = result
+
+    ranked_results = sorted(merged.values(), key=lambda result: result.score, reverse=True)[:top_k]
+    return [
+        RetrievalResult(rank=rank, score=result.score, chunk=result.chunk)
+        for rank, result in enumerate(ranked_results, start=1)
+    ]
 
 
 def retrieve_and_grade(
@@ -182,6 +303,8 @@ def retrieve_and_grade(
     neighbor_window: int,
     use_evidence_grader: bool,
     return_evidence_grade: bool,
+    rewrite_model: str,
+    allowed_example_id: str | None = None,
 ) -> tuple[list[RetrievalResult], RetrievalRoute, EvidenceGrade | None]:
     results, route = retrieve_with_route(
         question,
@@ -193,6 +316,7 @@ def retrieve_and_grade(
         bm25_index=bm25_index,
         candidate_k=candidate_k,
         neighbor_window=neighbor_window,
+        allowed_example_id=allowed_example_id,
     )
     evidence_grade = (
         grade_retrieved_evidence(question, results)
@@ -208,8 +332,9 @@ def retrieve_and_grade(
         and evidence_grade is not None
         and evidence_grade.needs_retry
     ):
+        rewritten_query = rewrite_query_for_retrieval(question, model=rewrite_model)
         corrected_results, corrected_route = retrieve_with_route(
-            question,
+            rewritten_query,
             chunks=chunks,
             index=index,
             metadata=metadata,
@@ -218,11 +343,17 @@ def retrieve_and_grade(
             bm25_index=bm25_index,
             candidate_k=max(candidate_k, CORRECTIVE_CANDIDATE_K),
             neighbor_window=max(neighbor_window, CORRECTIVE_NEIGHBOR_WINDOW),
+            allowed_example_id=allowed_example_id,
         )
-        corrected_grade = grade_retrieved_evidence(question, corrected_results)
+        merged_results = merge_retrieval_results(
+            primary_results=results,
+            corrective_results=corrected_results,
+            top_k=max(top_k, CORRECTIVE_TOP_K),
+        )
+        corrected_grade = grade_retrieved_evidence(question, merged_results)
 
         if corrected_grade.confidence >= evidence_grade.confidence:
-            return corrected_results, corrected_route, corrected_grade
+            return merged_results, corrected_route, corrected_grade
 
     return results, route, evidence_grade
 
@@ -237,6 +368,7 @@ def run_rag(
     model: str = DEFAULT_MODEL,
     use_evidence_grader: bool = False,
     return_evidence_grade: bool = False,
+    allowed_example_id: str | None = None,
 ) -> tuple[RAGAnswer, list[RetrievalResult], RetrievalRoute, EvidenceGrade | None]:
     chunks, index, metadata = load_retrieval_artifacts(limit=limit)
     bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid", "adaptive"} else None
@@ -255,6 +387,8 @@ def run_rag(
         neighbor_window=neighbor_window,
         use_evidence_grader=use_evidence_grader,
         return_evidence_grade=return_evidence_grade,
+        rewrite_model=model,
+        allowed_example_id=allowed_example_id,
     )
 
     if not route.related_to_index:

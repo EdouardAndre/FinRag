@@ -24,6 +24,7 @@ DEFAULT_RESULTS_DIR = Path("results")
 DEFAULT_LIMIT = 100
 DEFAULT_MAX_K = 10
 DEFAULT_CUTOFFS = (1, 3, 5, 10)
+RETRIEVAL_SCOPES = {"global", "example"}
 
 
 @dataclass(frozen=True)
@@ -35,11 +36,25 @@ class RetrievalEvaluation:
     reciprocal_rank: float
 
 
-def source_ids_from_results(results: list[RetrievalResult]) -> list[str]:
-    source_ids = []
+def evidence_id(example_id: str, source_id: str) -> str:
+    return f"{example_id}::{source_id}"
+
+
+def evidence_ids_from_results(results: list[RetrievalResult]) -> list[str]:
+    evidence_ids = []
     for result in results:
-        source_ids.extend(result.chunk.source_ids)
-    return source_ids
+        evidence_ids.extend(
+            evidence_id(result.chunk.example_id, source_id)
+            for source_id in result.chunk.source_ids
+        )
+    return evidence_ids
+
+
+def gold_evidence_ids(example: FinancialExample) -> set[str]:
+    return {
+        evidence_id(example.example_id, source_id)
+        for source_id in example.gold_evidence.keys()
+    }
 
 
 def hit_rate_at_k(retrieved_ids: list[str], gold_ids: set[str], k: int) -> float:
@@ -71,7 +86,9 @@ def evaluate_example(
     bm25_index,
     candidate_k: int,
     neighbor_window: int,
+    scope: str,
 ) -> RetrievalEvaluation:
+    allowed_example_id = example.example_id if scope == "example" else None
     results, route = retrieve_with_route(
         example.question,
         chunks=chunks,
@@ -82,12 +99,13 @@ def evaluate_example(
         bm25_index=bm25_index,
         candidate_k=candidate_k,
         neighbor_window=neighbor_window,
+        allowed_example_id=allowed_example_id,
     )
     if not route.related_to_index:
         results = []
 
-    retrieved_ids = source_ids_from_results(results)
-    gold_ids = set(example.gold_evidence.keys())
+    retrieved_ids = evidence_ids_from_results(results)
+    gold_ids = gold_evidence_ids(example)
 
     return RetrievalEvaluation(
         example_id=example.example_id,
@@ -165,8 +183,8 @@ def save_failures(
             )
 
 
-def default_failures_path(method: str) -> Path:
-    return DEFAULT_RESULTS_DIR / f"{method}_retrieval_failures.csv"
+def default_failures_path(method: str, scope: str) -> Path:
+    return DEFAULT_RESULTS_DIR / f"{method}_{scope}_retrieval_failures.csv"
 
 
 def print_metrics(metrics: dict[str, float | str]) -> None:
@@ -189,6 +207,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-k", type=int, default=DEFAULT_MAX_K)
     parser.add_argument("--neighbor-window", type=int, default=0)
     parser.add_argument("--method", choices=["dense", "bm25", "hybrid", "adaptive"], default="dense")
+    parser.add_argument("--scope", choices=sorted(RETRIEVAL_SCOPES), default="global")
     parser.add_argument("--failure-cutoff", type=int, default=5)
     parser.add_argument("--failures-path")
     return parser.parse_args()
@@ -214,15 +233,20 @@ def main() -> None:
             bm25_index=bm25_index,
             candidate_k=candidate_k,
             neighbor_window=args.neighbor_window,
+            scope=args.scope,
         )
         for example in examples
     ]
 
     metrics = summarize_evaluations(evaluations)
-    metrics = {"method": args.method, **metrics}
+    metrics = {"method": args.method, "scope": args.scope, **metrics}
     print_metrics(metrics)
 
-    failures_path = Path(args.failures_path) if args.failures_path else default_failures_path(args.method)
+    failures_path = (
+        Path(args.failures_path)
+        if args.failures_path
+        else default_failures_path(args.method, args.scope)
+    )
     save_failures(evaluations, failures_path, cutoff=args.failure_cutoff)
     print(f"failures saved to: {failures_path}")
 
