@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 try:
     from src.load_data import load_finqa_examples
-    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve
+    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
     from src.schemas import FinancialExample, RetrievalResult
 except ImportError:
     import sys
@@ -15,7 +15,7 @@ except ImportError:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
     from src.load_data import load_finqa_examples
-    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve
+    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
     from src.schemas import FinancialExample, RetrievalResult
 
 
@@ -72,7 +72,7 @@ def evaluate_example(
     candidate_k: int,
     neighbor_window: int,
 ) -> RetrievalEvaluation:
-    results = retrieve(
+    results, route = retrieve_with_route(
         example.question,
         chunks=chunks,
         index=index,
@@ -83,6 +83,9 @@ def evaluate_example(
         candidate_k=candidate_k,
         neighbor_window=neighbor_window,
     )
+    if not route.related_to_index:
+        results = []
+
     retrieved_ids = source_ids_from_results(results)
     gold_ids = set(example.gold_evidence.keys())
 
@@ -185,7 +188,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-k", type=int, default=DEFAULT_MAX_K)
     parser.add_argument("--candidate-k", type=int, default=DEFAULT_MAX_K)
     parser.add_argument("--neighbor-window", type=int, default=0)
-    parser.add_argument("--method", choices=["dense", "bm25", "hybrid"], default="dense")
+    parser.add_argument("--method", choices=["dense", "bm25", "hybrid", "adaptive"], default="dense")
     parser.add_argument("--failure-cutoff", type=int, default=5)
     parser.add_argument("--failures-path")
     return parser.parse_args()
@@ -198,7 +201,7 @@ def main() -> None:
 
     examples = load_finqa_examples(path=args.dataset_path, limit=args.limit)
     chunks, index, metadata = load_retrieval_artifacts(limit=args.limit)
-    bm25_index = build_bm25_index(chunks) if args.method in {"bm25", "hybrid"} else None
+    bm25_index = build_bm25_index(chunks) if args.method in {"bm25", "hybrid", "adaptive"} else None
 
     evaluations = [
         evaluate_example(

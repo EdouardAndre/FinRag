@@ -10,9 +10,11 @@ from rank_bm25 import BM25Okapi
 
 try:
     from .embed import ensure_chunks, create_mistral_client, normalize_vectors
+    from .router import SUPPORTED_RETRIEVAL_METHODS, RetrievalRoute, route_question
     from .schemas import Chunk, RetrievalResult
 except ImportError:
     from embed import ensure_chunks, create_mistral_client, normalize_vectors
+    from router import SUPPORTED_RETRIEVAL_METHODS, RetrievalRoute, route_question
     from schemas import Chunk, RetrievalResult
 
 
@@ -25,6 +27,7 @@ DEFAULT_TOP_K = 5
 DEFAULT_MODEL = "mistral-embed"
 DEFAULT_RRF_K = 60
 DEFAULT_NEIGHBOR_WINDOW = 0
+ADAPTIVE_METHOD = "adaptive"
 
 
 def tokenize(text: str) -> list[str]:
@@ -310,6 +313,66 @@ def retrieve(
     raise ValueError(f"Unsupported retrieval method: {method}")
 
 
+def resolve_retrieval_route(
+    query: str,
+    method: str,
+    top_k: int,
+    candidate_k: int,
+    neighbor_window: int,
+) -> RetrievalRoute:
+    if method == ADAPTIVE_METHOD:
+        return route_question(query)
+
+    if method not in SUPPORTED_RETRIEVAL_METHODS:
+        raise ValueError(f"Unsupported retrieval method: {method}")
+
+    return RetrievalRoute(
+        related_to_index=True,
+        method=method,
+        top_k=top_k,
+        candidate_k=max(candidate_k, top_k),
+        neighbor_window=neighbor_window,
+        reason="Explicit retrieval settings were provided.",
+        signals=[],
+    )
+
+
+def retrieve_with_route(
+    query: str,
+    chunks: list[Chunk],
+    index: faiss.Index,
+    metadata: dict,
+    method: str = "dense",
+    top_k: int = DEFAULT_TOP_K,
+    bm25_index: BM25Okapi | None = None,
+    candidate_k: int = 10,
+    neighbor_window: int = DEFAULT_NEIGHBOR_WINDOW,
+) -> tuple[list[RetrievalResult], RetrievalRoute]:
+    route = resolve_retrieval_route(
+        query=query,
+        method=method,
+        top_k=top_k,
+        candidate_k=candidate_k,
+        neighbor_window=neighbor_window,
+    )
+
+    if not route.related_to_index:
+        return [], route
+
+    results = retrieve(
+        query,
+        chunks=chunks,
+        index=index,
+        metadata=metadata,
+        top_k=route.top_k,
+        method=route.method,
+        bm25_index=bm25_index,
+        candidate_k=route.candidate_k,
+        neighbor_window=route.neighbor_window,
+    )
+    return results, route
+
+
 def print_retrieval_results(results: list[RetrievalResult]) -> None:
     for result in results:
         chunk = result.chunk
@@ -331,8 +394,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-k", type=int, default=10)
     parser.add_argument("--neighbor-window", type=int, default=DEFAULT_NEIGHBOR_WINDOW)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
-    parser.add_argument("--method", choices=["dense", "bm25", "hybrid"], default="dense")
+    parser.add_argument("--method", choices=["dense", "bm25", "hybrid", "adaptive"], default="dense")
+    parser.add_argument("--show-route", action="store_true")
     return parser.parse_args()
+
 
 def main() -> None:
     load_dotenv()
@@ -341,8 +406,8 @@ def main() -> None:
     chunks, index, metadata = load_retrieval_artifacts(
         limit=args.limit,
     )
-    bm25_index = build_bm25_index(chunks) if args.method in {"bm25", "hybrid"} else None
-    results = retrieve(
+    bm25_index = build_bm25_index(chunks) if args.method in {"bm25", "hybrid", "adaptive"} else None
+    results, route = retrieve_with_route(
         args.query,
         chunks,
         index,
@@ -353,7 +418,17 @@ def main() -> None:
         candidate_k=args.candidate_k,
         neighbor_window=args.neighbor_window,
     )
+    if args.show_route:
+        print(f"route_method: {route.method}")
+        print(f"route_top_k: {route.top_k}")
+        print(f"route_candidate_k: {route.candidate_k}")
+        print(f"route_neighbor_window: {route.neighbor_window}")
+        print(f"route_related_to_index: {route.related_to_index}")
+        print(f"route_signals: {route.signals}")
+        print(f"route_reason: {route.reason}")
+        print()
     print_retrieval_results(results)
+
 
 if __name__ == "__main__":
     main()

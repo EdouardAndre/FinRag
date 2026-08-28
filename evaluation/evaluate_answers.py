@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 try:
     from src.generate import generate_answer
     from src.load_data import load_finqa_examples
-    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve
+    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
     from src.schemas import FinancialExample, RAGAnswer, RetrievalResult
 except ImportError:
     import sys
@@ -18,7 +18,7 @@ except ImportError:
 
     from src.generate import generate_answer
     from src.load_data import load_finqa_examples
-    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve
+    from src.retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
     from src.schemas import FinancialExample, RAGAnswer, RetrievalResult
 
 
@@ -228,13 +228,13 @@ def evaluate_answers(
     model: str,
 ) -> list[AnswerEvaluation]:
     chunks, index, metadata = load_retrieval_artifacts(limit=len(examples))
-    bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid"} else None
+    bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid", "adaptive"} else None
     evaluations = []
 
     for position, example in enumerate(examples, start=1):
         print(f"evaluating {position}/{len(examples)}: {example.example_id}")
         try:
-            results = retrieve(
+            results, route = retrieve_with_route(
                 example.question,
                 chunks=chunks,
                 index=index,
@@ -245,6 +245,16 @@ def evaluate_answers(
                 candidate_k=max(candidate_k, top_k),
                 neighbor_window=neighbor_window,
             )
+            if not route.related_to_index:
+                answer = RAGAnswer(
+                    answer="Insufficient evidence",
+                    citations=[],
+                    calculation=None,
+                    insufficient_evidence=True,
+                )
+                evaluations.append(evaluate_answer(example, answer, results))
+                continue
+
             answer = generate_answer(example.question, results, model=model)
             evaluations.append(evaluate_answer(example, answer, results))
         except Exception as error:
@@ -257,7 +267,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate generated RAG answers against FinQA answers.")
     parser.add_argument("--dataset-path", default=str(DEFAULT_DATASET_PATH))
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
-    parser.add_argument("--method", choices=["dense", "bm25", "hybrid"], default="dense")
+    parser.add_argument("--method", choices=["dense", "bm25", "hybrid", "adaptive"], default="dense")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--candidate-k", type=int, default=10)
     parser.add_argument("--neighbor-window", type=int, default=0)

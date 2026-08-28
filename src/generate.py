@@ -9,11 +9,13 @@ from dotenv import load_dotenv
 
 try:
     from .embed import create_mistral_client
-    from .retrieve import build_bm25_index, load_retrieval_artifacts, retrieve
+    from .retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
+    from .router import RetrievalRoute
     from .schemas import Citation, RAGAnswer, RetrievalResult
 except ImportError:
     from embed import create_mistral_client
-    from retrieve import build_bm25_index, load_retrieval_artifacts, retrieve
+    from retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
+    from router import RetrievalRoute
     from schemas import Citation, RAGAnswer, RetrievalResult
 
 
@@ -170,10 +172,10 @@ def run_rag(
     neighbor_window: int = 0,
     limit: int = DEFAULT_LIMIT,
     model: str = DEFAULT_MODEL,
-) -> tuple[RAGAnswer, list[RetrievalResult]]:
+) -> tuple[RAGAnswer, list[RetrievalResult], RetrievalRoute]:
     chunks, index, metadata = load_retrieval_artifacts(limit=limit)
-    bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid"} else None
-    results = retrieve(
+    bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid", "adaptive"} else None
+    results, route = retrieve_with_route(
         question,
         chunks=chunks,
         index=index,
@@ -184,8 +186,21 @@ def run_rag(
         candidate_k=candidate_k,
         neighbor_window=neighbor_window,
     )
+
+    if not route.related_to_index:
+        return (
+            RAGAnswer(
+                answer="Insufficient evidence",
+                citations=[],
+                calculation=None,
+                insufficient_evidence=True,
+            ),
+            results,
+            route,
+        )
+
     answer = generate_answer(question, results, model=model)
-    return answer, results
+    return answer, results, route
 
 
 def print_answer(answer: RAGAnswer) -> None:
@@ -195,13 +210,14 @@ def print_answer(answer: RAGAnswer) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate grounded answers from retrieved FinQA evidence.")
     parser.add_argument("--query", required=True)
-    parser.add_argument("--method", choices=["dense", "bm25", "hybrid"], default="dense")
+    parser.add_argument("--method", choices=["dense", "bm25", "hybrid", "adaptive"], default="dense")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--candidate-k", type=int, default=10)
     parser.add_argument("--neighbor-window", type=int, default=0)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--show-evidence", action="store_true")
+    parser.add_argument("--show-route", action="store_true")
     return parser.parse_args()
 
 
@@ -209,7 +225,7 @@ def main() -> None:
     load_dotenv()
     args = parse_args()
 
-    answer, results = run_rag(
+    answer, results, route = run_rag(
         args.query,
         method=args.method,
         top_k=args.top_k,
@@ -218,6 +234,16 @@ def main() -> None:
         limit=args.limit,
         model=args.model,
     )
+
+    if args.show_route:
+        print(f"route_method: {route.method}")
+        print(f"route_top_k: {route.top_k}")
+        print(f"route_candidate_k: {route.candidate_k}")
+        print(f"route_neighbor_window: {route.neighbor_window}")
+        print(f"route_related_to_index: {route.related_to_index}")
+        print(f"route_signals: {route.signals}")
+        print(f"route_reason: {route.reason}")
+        print()
 
     print_answer(answer)
 
