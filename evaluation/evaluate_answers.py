@@ -2,27 +2,28 @@ import argparse
 import csv
 import json
 import re
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 try:
+    from src.generate import elapsed_ms
     from src.generate import generate_answer
     from src.generate import retrieve_and_grade
     from src.load_data import load_finqa_examples
     from src.retrieve import build_bm25_index, load_retrieval_artifacts
-    from src.schemas import FinancialExample, RAGAnswer, RetrievalResult
+    from src.schemas import FinancialExample, PipelineTrace, RAGAnswer, RetrievalResult
 except ImportError:
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-    from src.generate import generate_answer
-    from src.generate import retrieve_and_grade
+    from src.generate import elapsed_ms, generate_answer, retrieve_and_grade
     from src.load_data import load_finqa_examples
     from src.retrieve import build_bm25_index, load_retrieval_artifacts
-    from src.schemas import FinancialExample, RAGAnswer, RetrievalResult
+    from src.schemas import FinancialExample, PipelineTrace, RAGAnswer, RetrievalResult
 
 
 DEFAULT_DATASET_PATH = Path("data/FinQA/dataset/dev.json")
@@ -56,6 +57,25 @@ class AnswerEvaluation:
     evidence_grade_sufficient: bool | None = None
     evidence_grade_confidence: float | None = None
     evidence_grade_reason: str | None = None
+    total_ms: float = 0.0
+    retrieval_ms: float = 0.0
+    generation_ms: float = 0.0
+    evidence_grading_ms: float = 0.0
+    query_rewrite_ms: float = 0.0
+    corrective_retrieval_ms: float = 0.0
+    calculation_execution_ms: float = 0.0
+    embedding_calls: int = 0
+    generation_calls: int = 0
+    rewrite_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float | None = None
+    retrieved_chunks: int = 0
+    used_rerank: bool = False
+    used_evidence_grader: bool = False
+    used_corrective_retry: bool = False
+    route_method: str | None = None
 
 
 def normalize_answer(text: str) -> str:
@@ -129,7 +149,9 @@ def evaluate_answer(
     evidence_grade_sufficient: bool | None = None,
     evidence_grade_confidence: float | None = None,
     evidence_grade_reason: str | None = None,
+    trace: PipelineTrace | None = None,
 ) -> AnswerEvaluation:
+    trace = trace or PipelineTrace()
     return AnswerEvaluation(
         example_id=example.example_id,
         question=example.question,
@@ -155,10 +177,16 @@ def evaluate_answer(
         evidence_grade_sufficient=evidence_grade_sufficient,
         evidence_grade_confidence=evidence_grade_confidence,
         evidence_grade_reason=evidence_grade_reason,
+        **trace_fields(trace),
     )
 
 
-def failed_evaluation(example: FinancialExample, error: Exception) -> AnswerEvaluation:
+def failed_evaluation(
+    example: FinancialExample,
+    error: Exception,
+    trace: PipelineTrace | None = None,
+) -> AnswerEvaluation:
+    trace = trace or PipelineTrace()
     return AnswerEvaluation(
         example_id=example.example_id,
         question=example.question,
@@ -180,6 +208,7 @@ def failed_evaluation(example: FinancialExample, error: Exception) -> AnswerEval
         evidence_grade_sufficient=None,
         evidence_grade_confidence=None,
         evidence_grade_reason=None,
+        **trace_fields(trace),
     )
 
 
@@ -209,7 +238,31 @@ def summarize_evaluations(evaluations: list[AnswerEvaluation]) -> dict[str, floa
             [evaluation.insufficient_evidence for evaluation in completed]
         ),
         "error_rate": 1 - (len(completed) / len(evaluations) if evaluations else 0.0),
+        "avg_total_ms": average_float([evaluation.total_ms for evaluation in completed]),
+        "avg_retrieval_ms": average_float([evaluation.retrieval_ms for evaluation in completed]),
+        "avg_generation_ms": average_float([evaluation.generation_ms for evaluation in completed]),
+        "avg_estimated_cost_usd": average_optional_float(
+            [evaluation.estimated_cost_usd for evaluation in completed]
+        ),
+        "avg_embedding_calls": average_float([evaluation.embedding_calls for evaluation in completed]),
+        "avg_generation_calls": average_float([evaluation.generation_calls for evaluation in completed]),
+        "avg_retrieved_chunks": average_float([evaluation.retrieved_chunks for evaluation in completed]),
     }
+
+
+def average_float(values: list[float | int]) -> float:
+    if not values:
+        return 0.0
+
+    return sum(float(value) for value in values) / len(values)
+
+
+def average_optional_float(values: list[float | None]) -> float:
+    present_values = [value for value in values if value is not None]
+    if not present_values:
+        return 0.0
+
+    return sum(present_values) / len(present_values)
 
 
 def save_predictions(evaluations: list[AnswerEvaluation], path: str | Path) -> None:
@@ -240,6 +293,25 @@ def save_predictions(evaluations: list[AnswerEvaluation], path: str | Path) -> N
                 "evidence_grade_sufficient",
                 "evidence_grade_confidence",
                 "evidence_grade_reason",
+                "total_ms",
+                "retrieval_ms",
+                "generation_ms",
+                "evidence_grading_ms",
+                "query_rewrite_ms",
+                "corrective_retrieval_ms",
+                "calculation_execution_ms",
+                "embedding_calls",
+                "generation_calls",
+                "rewrite_calls",
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "estimated_cost_usd",
+                "retrieved_chunks",
+                "used_rerank",
+                "used_evidence_grader",
+                "used_corrective_retry",
+                "route_method",
             ],
         )
         writer.writeheader()
@@ -267,6 +339,29 @@ def save_predictions(evaluations: list[AnswerEvaluation], path: str | Path) -> N
                     "evidence_grade_sufficient": evaluation.evidence_grade_sufficient,
                     "evidence_grade_confidence": evaluation.evidence_grade_confidence,
                     "evidence_grade_reason": evaluation.evidence_grade_reason or "",
+                    "total_ms": f"{evaluation.total_ms:.2f}",
+                    "retrieval_ms": f"{evaluation.retrieval_ms:.2f}",
+                    "generation_ms": f"{evaluation.generation_ms:.2f}",
+                    "evidence_grading_ms": f"{evaluation.evidence_grading_ms:.2f}",
+                    "query_rewrite_ms": f"{evaluation.query_rewrite_ms:.2f}",
+                    "corrective_retrieval_ms": f"{evaluation.corrective_retrieval_ms:.2f}",
+                    "calculation_execution_ms": f"{evaluation.calculation_execution_ms:.2f}",
+                    "embedding_calls": evaluation.embedding_calls,
+                    "generation_calls": evaluation.generation_calls,
+                    "rewrite_calls": evaluation.rewrite_calls,
+                    "input_tokens": evaluation.input_tokens,
+                    "output_tokens": evaluation.output_tokens,
+                    "total_tokens": evaluation.total_tokens,
+                    "estimated_cost_usd": (
+                        f"{evaluation.estimated_cost_usd:.8f}"
+                        if evaluation.estimated_cost_usd is not None
+                        else ""
+                    ),
+                    "retrieved_chunks": evaluation.retrieved_chunks,
+                    "used_rerank": evaluation.used_rerank,
+                    "used_evidence_grader": evaluation.used_evidence_grader,
+                    "used_corrective_retry": evaluation.used_corrective_retry,
+                    "route_method": evaluation.route_method or "",
                 }
             )
 
@@ -276,6 +371,30 @@ def serialize_calculation_steps(answer: RAGAnswer) -> str:
         return ""
 
     return json.dumps([asdict(step) for step in answer.calculation_steps])
+
+
+def trace_fields(trace: PipelineTrace) -> dict:
+    return {
+        "total_ms": trace.stage_ms.get("total", 0.0),
+        "retrieval_ms": trace.stage_ms.get("retrieval", 0.0),
+        "generation_ms": trace.stage_ms.get("generation", 0.0),
+        "evidence_grading_ms": trace.stage_ms.get("evidence_grading", 0.0),
+        "query_rewrite_ms": trace.stage_ms.get("query_rewrite", 0.0),
+        "corrective_retrieval_ms": trace.stage_ms.get("corrective_retrieval", 0.0),
+        "calculation_execution_ms": trace.stage_ms.get("calculation_execution", 0.0),
+        "embedding_calls": trace.embedding_calls,
+        "generation_calls": trace.generation_calls,
+        "rewrite_calls": trace.rewrite_calls,
+        "input_tokens": trace.input_tokens,
+        "output_tokens": trace.output_tokens,
+        "total_tokens": trace.total_tokens,
+        "estimated_cost_usd": trace.estimated_cost_usd,
+        "retrieved_chunks": trace.retrieved_chunks,
+        "used_rerank": trace.used_rerank,
+        "used_evidence_grader": trace.used_evidence_grader,
+        "used_corrective_retry": trace.used_corrective_retry,
+        "route_method": trace.route_method,
+    }
 
 
 def print_metrics(metrics: dict[str, float | str]) -> None:
@@ -310,6 +429,8 @@ def evaluate_answers(
 
     for position, example in enumerate(examples, start=1):
         print(f"evaluating {position}/{len(examples)}: {example.example_id}")
+        trace = PipelineTrace()
+        total_start = time.perf_counter()
         try:
             results, route, grade = retrieve_and_grade(
                 example.question,
@@ -326,8 +447,10 @@ def evaluate_answers(
                 rewrite_model=model,
                 allowed_example_id=example.example_id if scope == "example" else None,
                 rerank=rerank,
+                trace=trace,
             )
             if not route.related_to_index:
+                trace.add_time("total", elapsed_ms(total_start))
                 answer = RAGAnswer(
                     answer="Insufficient evidence",
                     citations=[],
@@ -342,11 +465,13 @@ def evaluate_answers(
                         evidence_grade_sufficient=grade.is_sufficient,
                         evidence_grade_confidence=grade.confidence,
                         evidence_grade_reason=grade.missing_reason,
+                        trace=trace,
                     )
                 )
                 continue
 
-            answer = generate_answer(example.question, results, model=model)
+            answer = generate_answer(example.question, results, model=model, trace=trace)
+            trace.add_time("total", elapsed_ms(total_start))
 
             evaluations.append(
                 evaluate_answer(
@@ -356,10 +481,12 @@ def evaluate_answers(
                     evidence_grade_sufficient=grade.is_sufficient if grade else None,
                     evidence_grade_confidence=grade.confidence if grade else None,
                     evidence_grade_reason=grade.missing_reason if grade else None,
+                    trace=trace,
                 )
             )
         except Exception as error:
-            evaluations.append(failed_evaluation(example, error))
+            trace.add_time("total", elapsed_ms(total_start))
+            evaluations.append(failed_evaluation(example, error, trace=trace))
 
     return evaluations
 

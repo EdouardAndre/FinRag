@@ -56,6 +56,27 @@ class CalculationStep:
     arguments: list[Any]
 
 
+@dataclass
+class PipelineTrace:
+    stage_ms: dict[str, float] = field(default_factory=dict)
+    embedding_calls: int = 0
+    generation_calls: int = 0
+    rewrite_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float | None = None
+    retrieved_chunks: int = 0
+    used_rerank: bool = False
+    used_evidence_grader: bool = False
+    used_corrective_retry: bool = False
+    route_method: str | None = None
+    route_related_to_index: bool | None = None
+
+    def add_time(self, stage: str, elapsed_ms: float) -> None:
+        self.stage_ms[stage] = self.stage_ms.get(stage, 0.0) + elapsed_ms
+
+
 @dataclass(frozen=True)
 class RAGAnswer:
     answer: str

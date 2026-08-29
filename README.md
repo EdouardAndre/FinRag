@@ -1,12 +1,46 @@
 # FinRag
 
 FinRag is an evaluated Retrieval-Augmented Generation system for financial question answering on
-[FinQA](https://github.com/czyssrs/FinQA). The project retrieves evidence from financial report
-tables and text, generates cited answers with Mistral models, and evaluates where the pipeline fails:
-retrieval, evidence sufficiency, citation validity, abstention, or numerical reasoning.
+[FinQA](https://github.com/czyssrs/FinQA). It retrieves evidence from financial report tables and
+text, generates cited answers with Mistral models, executes numerical calculations deterministically,
+and measures where the pipeline fails: retrieval, evidence sufficiency, citation validity, abstention,
+or numerical reasoning.
 
-The current system is intentionally experimental. The goal is not only to produce answers, but to make
-each stage measurable enough that improvements can be tested instead of guessed.
+## Recruiter Snapshot
+
+This project is built to show end-to-end AI engineering judgment, not just a demo prompt.
+
+- **Real dataset:** FinQA financial report questions with tables, paragraphs, gold evidence, and gold answers.
+- **Production-shaped RAG:** structure-aware chunking, FAISS dense retrieval, BM25, hybrid retrieval,
+  adaptive routing, reranking, corrective retrieval, cited generation, and deterministic calculation execution.
+- **Evaluation-first workflow:** retrieval recall, answer accuracy, citation validity, abstention rate,
+  execution success, error analysis, and experiment CSVs.
+- **Measured architecture changes:** the project follows a clear loop:
+  `measure -> diagnose -> modify retrieval/generation -> remeasure`.
+- **Usable interface:** a Streamlit app lets someone ask a financial question and inspect the answer,
+  citations, retrieved evidence, route decision, evidence grade, calculation trace, and latency/cost trace.
+- **Engineering narrative:** global retrieval was diagnosed as a bottleneck, reranking and structured
+  calculation were added, and the best tested path improved numerical accuracy while reducing abstention.
+
+Latest documented 20-example adaptive reranked run:
+
+```text
+completed: 20/20
+error_rate: 0.0000
+citation_validity: 1.0000
+execution_error_rate: 0.0000
+```
+
+Best documented comparison from the global experiment:
+
+```text
+configuration       numerical_match   insufficient_evidence_rate   execution_success_rate
+dense baseline      0.4737            0.3684                       0.5263
+adaptive reranked   0.6111            0.1667                       0.7222
+```
+
+The point of the project is not to claim that the RAG is finished. The point is that every meaningful
+failure mode is visible enough to improve systematically.
 
 ## What This Project Does
 
@@ -24,6 +58,7 @@ each stage measurable enough that improvements can be tested instead of guessed.
 - Performs corrective retrieval using query rewriting, hybrid retrieval, larger `top_k`, and neighbors.
 - Generates JSON answers with citations.
 - For numerical questions, asks the LLM for structured calculation steps and executes them deterministically in Python.
+- Tracks latency, model calls, token usage, and optional estimated generation cost.
 - Evaluates retrieval and answer quality with CSV outputs for failure analysis.
 
 ## Architecture
@@ -189,6 +224,46 @@ Useful options:
 
 The embedding index stores one vector per chunk. The vector at FAISS row `i` corresponds to chunk
 `chunks[i]` from `data/chunks.json`, and metadata is kept in `data/index_metadata.json`.
+
+## Latency And Cost Instrumentation
+
+The pipeline records a `PipelineTrace` for each generated answer. It tracks:
+
+- latency per stage: artifact loading, retrieval, evidence grading, query rewriting, corrective
+  retrieval, generation, calculation execution, and total runtime;
+- embedding, generation, and rewrite call counts;
+- input, output, and total tokens when the Mistral response exposes usage metadata;
+- retrieved chunk count;
+- whether reranking, evidence grading, corrective retry, and adaptive routing were used;
+- optional estimated generation cost.
+
+Cost estimates are intentionally not hardcoded because model pricing changes. To enable estimates,
+put current prices in your `.env` file:
+
+```bash
+MISTRAL_INPUT_COST_PER_1M_TOKENS=...
+MISTRAL_OUTPUT_COST_PER_1M_TOKENS=...
+```
+
+Inspect a single trace from the CLI:
+
+```bash
+.venv/bin/python src/generate.py \
+  --query "what is the average payment volume per transaction for american express?" \
+  --method dense \
+  --top-k 10 \
+  --candidate-k 30 \
+  --rerank \
+  --show-trace
+```
+
+Answer evaluation CSVs also include trace columns such as `total_ms`, `retrieval_ms`,
+`generation_ms`, `embedding_calls`, `generation_calls`, `input_tokens`, `output_tokens`,
+`estimated_cost_usd`, `used_rerank`, `used_evidence_grader`, and `used_corrective_retry`.
+
+This makes it possible to discuss quality-vs-latency tradeoffs concretely. For example, reranking or
+corrective retrieval may improve answer quality, but the trace shows whether the gain came with extra
+retrieval time, extra LLM calls, or higher token cost.
 
 ## Run Retrieval
 
@@ -505,6 +580,7 @@ The app lets you enter a question and inspect:
 - executed answer;
 - retrieval route;
 - evidence grade;
+- latency and cost trace;
 - retrieved chunks.
 
 ## Current Findings

@@ -4,6 +4,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from src.generate import run_rag
+from src.schemas import PipelineTrace
 
 
 DEFAULT_QUESTION = "what is the average payment volume per transaction for american express?"
@@ -36,6 +37,7 @@ def main() -> None:
 
     with st.spinner("Retrieving evidence and generating an answer..."):
         try:
+            trace = PipelineTrace()
             answer, results, route, grade = run_rag(
                 question.strip(),
                 method=method,
@@ -46,6 +48,7 @@ def main() -> None:
                 use_evidence_grader=use_evidence_grader,
                 return_evidence_grade=True,
                 rerank=rerank,
+                trace=trace,
             )
         except Exception as error:
             st.error(str(error))
@@ -88,6 +91,11 @@ def main() -> None:
                 "calculation_steps": [asdict(step) for step in answer.calculation_steps],
             }
         )
+
+        st.subheader("Latency / Cost")
+        st.metric("Total latency", f"{trace.stage_ms.get('total', 0.0):.0f} ms")
+        st.metric("Generation latency", f"{trace.stage_ms.get('generation', 0.0):.0f} ms")
+        st.json(asdict(trace))
 
     if show_evidence:
         st.subheader("Retrieved Evidence")

@@ -1,6 +1,8 @@
 import argparse
 import json
+import os
 import re
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -14,7 +16,7 @@ try:
     from .query_rewrite import rewrite_query_for_retrieval
     from .retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
     from .router import RetrievalRoute
-    from .schemas import CalculationStep, Citation, EvidenceGrade, RAGAnswer, RetrievalResult
+    from .schemas import CalculationStep, Citation, EvidenceGrade, PipelineTrace, RAGAnswer, RetrievalResult
 except ImportError:
     from calculation import execute_calculation_steps
     from embed import create_mistral_client
@@ -22,7 +24,7 @@ except ImportError:
     from query_rewrite import rewrite_query_for_retrieval
     from retrieve import build_bm25_index, load_retrieval_artifacts, retrieve_with_route
     from router import RetrievalRoute
-    from schemas import CalculationStep, Citation, EvidenceGrade, RAGAnswer, RetrievalResult
+    from schemas import CalculationStep, Citation, EvidenceGrade, PipelineTrace, RAGAnswer, RetrievalResult
 
 
 DEFAULT_MODEL = "mistral-small-latest"
@@ -32,6 +34,8 @@ CORRECTIVE_METHOD = "hybrid"
 CORRECTIVE_TOP_K = 10
 CORRECTIVE_CANDIDATE_K = 30
 CORRECTIVE_NEIGHBOR_WINDOW = 1
+MISTRAL_INPUT_COST_PER_1M_ENV = "MISTRAL_INPUT_COST_PER_1M_TOKENS"
+MISTRAL_OUTPUT_COST_PER_1M_ENV = "MISTRAL_OUTPUT_COST_PER_1M_TOKENS"
 
 
 SYSTEM_PROMPT = """You answer financial questions using only the supplied evidence.
@@ -47,6 +51,60 @@ Rules:
 - Never invent a citation.
 - Return valid JSON only.
 """
+
+
+def elapsed_ms(start: float) -> float:
+    return (time.perf_counter() - start) * 1000
+
+
+def add_token_usage(trace: PipelineTrace | None, response: Any) -> None:
+    if trace is None:
+        return
+
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+
+    prompt_tokens = usage_value(usage, "prompt_tokens")
+    completion_tokens = usage_value(usage, "completion_tokens")
+    total_tokens = usage_value(usage, "total_tokens")
+
+    trace.input_tokens += prompt_tokens
+    trace.output_tokens += completion_tokens
+    trace.total_tokens += total_tokens or prompt_tokens + completion_tokens
+    trace.estimated_cost_usd = estimate_generation_cost(trace.input_tokens, trace.output_tokens)
+
+
+def usage_value(usage: Any, name: str) -> int:
+    if isinstance(usage, dict):
+        return int(usage.get(name) or 0)
+
+    return int(getattr(usage, name, 0) or 0)
+
+
+def estimate_generation_cost(input_tokens: int, output_tokens: int) -> float | None:
+    input_cost = optional_float_env(MISTRAL_INPUT_COST_PER_1M_ENV)
+    output_cost = optional_float_env(MISTRAL_OUTPUT_COST_PER_1M_ENV)
+    if input_cost is None or output_cost is None:
+        return None
+
+    return (input_tokens / 1_000_000 * input_cost) + (output_tokens / 1_000_000 * output_cost)
+
+
+def optional_float_env(name: str) -> float | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+
+    return float(value)
+
+
+def count_embedding_call_for_method(method: str, trace: PipelineTrace | None) -> None:
+    if trace is None:
+        return
+
+    if method in {"dense", "hybrid"}:
+        trace.embedding_calls += 1
 
 
 def format_evidence(results: list[RetrievalResult]) -> str:
@@ -252,8 +310,10 @@ def generate_answer(
     model: str = DEFAULT_MODEL,
     temperature: float = 0.0,
     max_tokens: int = 512,
+    trace: PipelineTrace | None = None,
 ) -> RAGAnswer:
     client = create_mistral_client()
+    start = time.perf_counter()
     response = client.chat.complete(
         model=model,
         messages=[
@@ -264,12 +324,19 @@ def generate_answer(
         max_tokens=max_tokens,
         response_format={"type": "json_object"},
     )
+    if trace is not None:
+        trace.generation_calls += 1
+        trace.add_time("generation", elapsed_ms(start))
+        add_token_usage(trace, response)
 
     content = response.choices[0].message.content
     payload = extract_json_object(content)
     answer = parse_rag_answer(payload)
     answer = canonicalize_answer_citations(answer, results)
+    start = time.perf_counter()
     answer = apply_deterministic_calculation(answer)
+    if trace is not None:
+        trace.add_time("calculation_execution", elapsed_ms(start))
     validate_citations(answer, results)
     return answer
 
@@ -309,7 +376,9 @@ def retrieve_and_grade(
     rewrite_model: str,
     allowed_example_id: str | None = None,
     rerank: bool = False,
+    trace: PipelineTrace | None = None,
 ) -> tuple[list[RetrievalResult], RetrievalRoute, EvidenceGrade | None]:
+    start = time.perf_counter()
     results, route = retrieve_with_route(
         question,
         chunks=chunks,
@@ -323,13 +392,29 @@ def retrieve_and_grade(
         allowed_example_id=allowed_example_id,
         rerank=rerank,
     )
+    if trace is not None:
+        trace.add_time("retrieval", elapsed_ms(start))
+        trace.retrieved_chunks = len(results)
+        trace.used_rerank = rerank
+        trace.used_evidence_grader = use_evidence_grader
+        trace.route_method = route.method
+        trace.route_related_to_index = route.related_to_index
+        count_embedding_call_for_method(route.method, trace)
+
+    start = time.perf_counter()
     evidence_grade = (
         grade_retrieved_evidence(question, results)
         if use_evidence_grader or return_evidence_grade
         else None
     )
+    if trace is not None and (use_evidence_grader or return_evidence_grade):
+        trace.add_time("evidence_grading", elapsed_ms(start))
+
     if not route.related_to_index and evidence_grade is None:
+        start = time.perf_counter()
         evidence_grade = grade_retrieved_evidence(question, results)
+        if trace is not None:
+            trace.add_time("evidence_grading", elapsed_ms(start))
 
     if (
         use_evidence_grader
@@ -337,7 +422,14 @@ def retrieve_and_grade(
         and evidence_grade is not None
         and evidence_grade.needs_retry
     ):
+        start = time.perf_counter()
         rewritten_query = rewrite_query_for_retrieval(question, model=rewrite_model)
+        if trace is not None:
+            trace.rewrite_calls += 1
+            trace.used_corrective_retry = True
+            trace.add_time("query_rewrite", elapsed_ms(start))
+
+        start = time.perf_counter()
         corrected_results, corrected_route = retrieve_with_route(
             rewritten_query,
             chunks=chunks,
@@ -351,14 +443,24 @@ def retrieve_and_grade(
             allowed_example_id=allowed_example_id,
             rerank=True,
         )
+        if trace is not None:
+            trace.add_time("corrective_retrieval", elapsed_ms(start))
+            count_embedding_call_for_method(corrected_route.method, trace)
+
         merged_results = merge_retrieval_results(
             primary_results=results,
             corrective_results=corrected_results,
             top_k=max(top_k, CORRECTIVE_TOP_K),
         )
+        start = time.perf_counter()
         corrected_grade = grade_retrieved_evidence(question, merged_results)
+        if trace is not None:
+            trace.add_time("evidence_grading", elapsed_ms(start))
 
         if corrected_grade.confidence >= evidence_grade.confidence:
+            if trace is not None:
+                trace.retrieved_chunks = len(merged_results)
+                trace.route_method = corrected_route.method
             return merged_results, corrected_route, corrected_grade
 
     return results, route, evidence_grade
@@ -376,11 +478,16 @@ def run_rag(
     return_evidence_grade: bool = False,
     allowed_example_id: str | None = None,
     rerank: bool = False,
+    trace: PipelineTrace | None = None,
 ) -> tuple[RAGAnswer, list[RetrievalResult], RetrievalRoute, EvidenceGrade | None]:
+    total_start = time.perf_counter()
+    artifact_start = time.perf_counter()
     chunks, index, metadata = load_retrieval_artifacts(limit=limit)
     bm25_index = build_bm25_index(chunks) if method in {"bm25", "hybrid", "adaptive"} else None
     if use_evidence_grader and bm25_index is None:
         bm25_index = build_bm25_index(chunks)
+    if trace is not None:
+        trace.add_time("artifact_loading", elapsed_ms(artifact_start))
 
     results, route, evidence_grade = retrieve_and_grade(
         question,
@@ -397,9 +504,12 @@ def run_rag(
         rewrite_model=model,
         allowed_example_id=allowed_example_id,
         rerank=rerank,
+        trace=trace,
     )
 
     if not route.related_to_index:
+        if trace is not None:
+            trace.add_time("total", elapsed_ms(total_start))
         return (
             RAGAnswer(
                 answer="Insufficient evidence",
@@ -412,7 +522,9 @@ def run_rag(
             evidence_grade or grade_retrieved_evidence(question, results),
         )
 
-    answer = generate_answer(question, results, model=model)
+    answer = generate_answer(question, results, model=model, trace=trace)
+    if trace is not None:
+        trace.add_time("total", elapsed_ms(total_start))
     return answer, results, route, evidence_grade
 
 
@@ -434,6 +546,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-evidence-grader", action="store_true")
     parser.add_argument("--show-grade", action="store_true")
     parser.add_argument("--rerank", action="store_true")
+    parser.add_argument("--show-trace", action="store_true")
     return parser.parse_args()
 
 
@@ -441,6 +554,7 @@ def main() -> None:
     load_dotenv()
     args = parse_args()
 
+    trace = PipelineTrace()
     answer, results, route, evidence_grade = run_rag(
         args.query,
         method=args.method,
@@ -452,6 +566,7 @@ def main() -> None:
         use_evidence_grader=args.use_evidence_grader,
         return_evidence_grade=args.show_grade,
         rerank=args.rerank,
+        trace=trace,
     )
 
     if args.show_route:
@@ -467,6 +582,11 @@ def main() -> None:
     if args.show_grade and evidence_grade is not None:
         print("evidence_grade:")
         print(json.dumps(asdict(evidence_grade), indent=2))
+        print()
+
+    if args.show_trace:
+        print("trace:")
+        print(json.dumps(asdict(trace), indent=2))
         print()
 
     print_answer(answer)
