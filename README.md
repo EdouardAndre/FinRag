@@ -6,20 +6,21 @@ text, generates cited answers with Mistral models, executes numerical calculatio
 and measures where the pipeline fails: retrieval, evidence sufficiency, citation validity, abstention,
 or numerical reasoning.
 
-## Recruiter Snapshot
+## Project At A Glance
 
-This project is built to show end-to-end AI engineering judgment, not just a demo prompt.
+FinRag is a small but complete RAG system for answering financial questions that require evidence
+retrieval, table understanding, citations, and numerical reasoning.
 
 - **Real dataset:** FinQA financial report questions with tables, paragraphs, gold evidence, and gold answers.
-- **Production-shaped RAG:** structure-aware chunking, FAISS dense retrieval, BM25, hybrid retrieval,
+- **Full RAG pipeline:** structure-aware chunking, FAISS dense retrieval, BM25, hybrid retrieval,
   adaptive routing, reranking, corrective retrieval, cited generation, and deterministic calculation execution.
-- **Evaluation-first workflow:** retrieval recall, answer accuracy, citation validity, abstention rate,
+- **Evaluation built in:** retrieval recall, answer accuracy, citation validity, abstention rate,
   execution success, error analysis, and experiment CSVs.
-- **Measured architecture changes:** the project follows a clear loop:
+- **Measurable iteration:** the project follows a clear loop:
   `measure -> diagnose -> modify retrieval/generation -> remeasure`.
-- **Usable interface:** a Streamlit app lets someone ask a financial question and inspect the answer,
+- **Usable interface:** a Streamlit app lets you ask a financial question and inspect the answer,
   citations, retrieved evidence, route decision, evidence grade, calculation trace, and latency/cost trace.
-- **Engineering narrative:** global retrieval was diagnosed as a bottleneck, reranking and structured
+- **Documented tradeoffs:** global retrieval was diagnosed as a bottleneck, reranking and structured
   calculation were added, and the best tested path improved numerical accuracy while reducing abstention.
 
 Latest documented 20-example adaptive reranked run:
