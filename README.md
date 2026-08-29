@@ -579,9 +579,20 @@ adaptive baseline   0.5000            0.3500                       0.5500
 adaptive reranked   0.6111            0.1667                       0.7222
 ```
 
-The main caveat is stability: `adaptive_reranked_answers` completed 18/20 examples, with
-`error_rate: 0.1000`. The best-performing path is therefore promising, but the next engineering step
-is to inspect and fix those failures before treating it as the default production path.
+The initial adaptive reranked run exposed two parser failures when the model returned `null` for
+list-shaped JSON fields. Those were fixed by normalizing missing `citations` and `calculation_steps`
+to empty lists. A follow-up 20-example run completed without pipeline, citation, or execution errors:
+
+```text
+adaptive reranked fixed
+completed: 20/20
+error_rate: 0.0000
+citation_validity: 1.0000
+execution_error_rate: 0.0000
+```
+
+The best-performing path is therefore more stable, but numerical accuracy still varies across runs
+because the LLM can choose different operands or abstain even when the pipeline itself succeeds.
 
 The current engineering narrative is:
 
@@ -603,11 +614,10 @@ calculation execution -> remeasure -> improve numerical accuracy and reduce abst
 
 ## Recommended Next Improvements
 
-1. Inspect and fix the two `adaptive_reranked_answers` pipeline failures.
-2. Add a document/page selection stage before chunk retrieval.
-3. Replace the current heuristic reranker with a stronger cross-encoder or LLM reranker.
-4. Improve program generation by validating that operands appear in cited chunks.
-5. Add support for FinQA table aggregate programs such as `table_average`, `table_sum`, `table_min`,
+1. Add a document/page selection stage before chunk retrieval.
+2. Replace the current heuristic reranker with a stronger cross-encoder or LLM reranker.
+3. Improve program generation by validating that operands appear in cited chunks.
+4. Add support for FinQA table aggregate programs such as `table_average`, `table_sum`, `table_min`,
    and `table_max`.
-6. Calibrate the evidence grader against strict gold evidence labels.
-7. Evaluate on larger indexed subsets after rebuilding the full required index.
+5. Calibrate the evidence grader against strict gold evidence labels.
+6. Evaluate on larger indexed subsets after rebuilding the full required index.

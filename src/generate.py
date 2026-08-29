@@ -118,24 +118,27 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 
 def parse_rag_answer(payload: dict[str, Any]) -> RAGAnswer:
+    raw_citations = payload.get("citations") or []
     citations = [
         Citation(
             chunk_id=normalize_generated_chunk_id(str(citation.get("chunk_id", ""))),
             quote=str(citation.get("quote", "")),
         )
-        for citation in payload.get("citations", [])
+        for citation in raw_citations
+        if isinstance(citation, dict)
     ]
 
     calculation = payload.get("calculation")
     if calculation is not None:
         calculation = str(calculation)
 
+    raw_calculation_steps = payload.get("calculation_steps") or []
     calculation_steps = [
         CalculationStep(
             operation=str(step.get("operation", "")),
-            arguments=list(step.get("arguments", [])),
+            arguments=list(step.get("arguments") or []),
         )
-        for step in payload.get("calculation_steps", [])
+        for step in raw_calculation_steps
         if isinstance(step, dict)
     ]
 
