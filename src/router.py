@@ -4,7 +4,7 @@ import re
 
 SUPPORTED_RETRIEVAL_METHODS = {"dense", "bm25", "hybrid"}
 DEFAULT_ADAPTIVE_TOP_K = 10
-DEFAULT_ADAPTIVE_CANDIDATE_K = 20
+DEFAULT_ADAPTIVE_CANDIDATE_K = 30
 
 CALCULATION_TERMS = {
     "average",
@@ -59,8 +59,12 @@ class RetrievalRoute:
     signals: list[str] = field(default_factory=list)
 
 
-def route_question(question: str) -> RetrievalRoute:
+def route_question(
+    question: str,
+    candidate_k: int | None = None,
+) -> RetrievalRoute:
     signals = detect_question_signals(question)
+    resolved_candidate_k = max(candidate_k or 0, DEFAULT_ADAPTIVE_CANDIDATE_K)
 
     if "out_of_scope" in signals:
         return RetrievalRoute(
@@ -78,7 +82,7 @@ def route_question(question: str) -> RetrievalRoute:
             related_to_index=True,
             method="dense",
             top_k=DEFAULT_ADAPTIVE_TOP_K,
-            candidate_k=DEFAULT_ADAPTIVE_CANDIDATE_K,
+            candidate_k=resolved_candidate_k,
             neighbor_window=1,
             reason="Numeric or table-like question; use dense retrieval plus neighbors for calculation context.",
             signals=signals,
@@ -89,7 +93,7 @@ def route_question(question: str) -> RetrievalRoute:
             related_to_index=True,
             method="hybrid",
             top_k=DEFAULT_ADAPTIVE_TOP_K,
-            candidate_k=DEFAULT_ADAPTIVE_CANDIDATE_K,
+            candidate_k=resolved_candidate_k,
             neighbor_window=0,
             reason="Question contains exact terms or dates; combine dense and lexical retrieval.",
             signals=signals,
@@ -99,7 +103,7 @@ def route_question(question: str) -> RetrievalRoute:
         related_to_index=True,
         method="dense",
         top_k=DEFAULT_ADAPTIVE_TOP_K,
-        candidate_k=DEFAULT_ADAPTIVE_CANDIDATE_K,
+        candidate_k=resolved_candidate_k,
         neighbor_window=0,
         reason="Default report question route; dense retrieval is the strongest current baseline.",
         signals=signals,

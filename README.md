@@ -6,6 +6,11 @@ text, generates cited answers with Mistral models, executes numerical calculatio
 and measures where the pipeline fails: retrieval, evidence sufficiency, citation validity, abstention,
 or numerical reasoning.
 
+The primary benchmark follows FinQA's intended setting: a question is paired with its financial
+report, and the retriever must find the supporting facts inside that report. FinRag also includes a
+separate open-corpus stress test that searches all 883 development-set reports; those results are
+reported separately because FinQA questions often assume that the report is already known.
+
 ## Project At A Glance
 
 FinRag is a small but complete RAG system for answering financial questions that require evidence
@@ -20,28 +25,35 @@ retrieval, table understanding, citations, and numerical reasoning.
   `measure -> diagnose -> modify retrieval/generation -> remeasure`.
 - **Usable interface:** a Streamlit app lets you ask a financial question and inspect the answer,
   citations, retrieved evidence, route decision, evidence grade, calculation trace, and latency/cost trace.
-- **Documented tradeoffs:** global retrieval was diagnosed as a bottleneck, reranking and structured
-  calculation were added, and the best tested path improved numerical accuracy while reducing abstention.
+- **Comparable primary benchmark:** full-development-set report-scoped retrieval follows FinQA's
+  standard task definition.
+- **Harder extension:** open-corpus retrieval measures document discovery and evidence retrieval
+  jointly across all 883 reports.
 
-Latest documented 20-example adaptive reranked run:
-
-```text
-completed: 20/20
-error_rate: 0.0000
-citation_validity: 1.0000
-execution_error_rate: 0.0000
-```
-
-Best documented comparison from the global experiment:
+Primary full-dev retrieval result:
 
 ```text
-configuration       numerical_match   insufficient_evidence_rate   execution_success_rate
-dense baseline      0.4737            0.3684                       0.5263
-adaptive reranked   0.6111            0.1667                       0.7222
+BM25 + heuristic reranking, report-scoped, 883 examples
+MRR:        0.7160
+Hit@5:      0.9309
+Recall@5:   0.8397
+Hit@10:     0.9796
+Recall@10:  0.9342
 ```
 
-The point of the project is not to claim that the RAG is finished. The point is that every meaningful
-failure mode is visible enough to improve systematically.
+Open-corpus stress-test result:
+
+```text
+Adaptive + heuristic reranking, global, 883 examples
+MRR:        0.3410
+Hit@5:      0.6014
+Recall@5:   0.4642
+Hit@10:     0.7225
+Recall@10:  0.5914
+```
+
+These two settings are not directly comparable: report-scoped retrieval answers the FinQA benchmark
+question, while global retrieval additionally has to infer which report the question refers to.
 
 ## What This Project Does
 
@@ -160,6 +172,8 @@ flowchart TD
 │   ├── retrieve.py               # Dense, BM25, hybrid, adaptive retrieval
 │   ├── router.py                 # Adaptive retrieval router
 │   └── schemas.py                # Shared data models
+├── tests/
+│   └── test_retrieval_routing.py # Neighbor-order and adaptive-candidate regressions
 ├── app.py                        # Streamlit interface
 └── README.md
 ```
@@ -197,9 +211,8 @@ The default dataset path used by the project is:
 data/FinQA/dataset/dev.json
 ```
 
-The current index was built on a limited dev subset. If you evaluate more examples than were indexed,
-the missing examples cannot be retrieved. Rebuild the chunks and index when changing the dataset split
-or limit.
+The index must cover every example used by an evaluation. Rebuild the chunks and index whenever the
+dataset split or indexed limit changes.
 
 ## Build Chunks And Embeddings
 
@@ -288,7 +301,7 @@ Show the adaptive route decision:
   --show-route
 ```
 
-Run an example-scoped diagnostic retrieval:
+Run report-scoped retrieval for a known FinQA report:
 
 ```bash
 .venv/bin/python src/retrieve.py \
@@ -298,9 +311,8 @@ Run an example-scoped diagnostic retrieval:
   --allowed-example-id V/2008/page_17.pdf-1
 ```
 
-Example-scoped retrieval is a diagnostic control, not a production feature. It answers the question:
-"If the correct FinQA example/document had already been selected, can the evidence retriever find the
-right chunks?"
+In FinQA, the question is paired with its report. `--allowed-example-id` applies that standard
+report scope to an individual query; it does not reveal the gold evidence rows.
 
 ## Retrieval Modes
 
@@ -415,28 +427,37 @@ operands, the executed answer will still be wrong.
 
 ## Evaluation
 
+Evaluation commands default to `--scope example`, the report-scoped FinQA setting. Pass
+`--scope global` explicitly for the open-corpus extension.
+
 ### Retrieval Evaluation
 
-Global retrieval:
+Report-scoped retrieval is the primary FinQA benchmark:
 
 ```bash
 .venv/bin/python evaluation/evaluate_retrieval.py \
-  --method dense \
-  --limit 100 \
+  --dataset-path data/FinQA/dataset/dev.json \
+  --method bm25 \
+  --limit 883 \
   --max-k 10 \
   --candidate-k 30 \
   --rerank \
-  --scope global
+  --scope example \
+  --failures-path results/bm25_scoped_reranked_failures.csv
 ```
 
-Example-scoped diagnostic retrieval:
+Open-corpus retrieval is an additional stress test across all indexed reports:
 
 ```bash
 .venv/bin/python evaluation/evaluate_retrieval.py \
-  --method dense \
-  --limit 100 \
+  --dataset-path data/FinQA/dataset/dev.json \
+  --method adaptive \
+  --limit 883 \
   --max-k 10 \
-  --scope example
+  --candidate-k 30 \
+  --rerank \
+  --scope global \
+  --failures-path results/adaptive_global_reranked_fixed_failures.csv
 ```
 
 Retrieval evaluation uses strict evidence IDs:
@@ -456,7 +477,20 @@ Metrics:
 
 ### Answer Evaluation
 
-Global end-to-end evaluation:
+Report-scoped end-to-end evaluation:
+
+```bash
+.venv/bin/python evaluation/evaluate_answers.py \
+  --method dense \
+  --limit 20 \
+  --top-k 10 \
+  --candidate-k 30 \
+  --rerank \
+  --scope example \
+  --predictions-path results/dense_example_answers.csv
+```
+
+Open-corpus end-to-end evaluation:
 
 ```bash
 .venv/bin/python evaluation/evaluate_answers.py \
@@ -467,19 +501,6 @@ Global end-to-end evaluation:
   --rerank \
   --scope global \
   --predictions-path results/dense_global_answers.csv
-```
-
-Example-scoped diagnostic evaluation:
-
-```bash
-.venv/bin/python evaluation/evaluate_answers.py \
-  --method dense \
-  --limit 20 \
-  --top-k 10 \
-  --candidate-k 30 \
-  --rerank \
-  --scope example \
-  --predictions-path results/dense_example_structured_calculation_answers.csv
 ```
 
 Metrics:
@@ -502,8 +523,8 @@ answers often omit units such as `million`, `shares`, or `$`.
   --method dense \
   --limit 100 \
   --top-k 10 \
-  --scope global \
-  --results-path results/evidence_grader_global.csv
+  --scope example \
+  --results-path results/evidence_grader_scoped.csv
 ```
 
 The grader is heuristic. It checks signals such as metric overlap, year support, numeric support,
@@ -565,6 +586,17 @@ The runner writes:
 The larger command uses API calls for embedding and answer generation. Start with smaller limits if
 you want to control cost.
 
+## Tests
+
+Run the local regression tests:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+The tests verify that adaptive retrieval keeps a 30-candidate minimum, honors larger candidate pools,
+and preserves ranked seed chunks ahead of contextual neighbors.
+
 ## Interface
 
 Run the Streamlit interface:
@@ -586,18 +618,52 @@ The app lets you enter a question and inspect:
 
 ## Current Findings
 
-### Diagnostic Scoped Retrieval
+### Primary FinQA Retrieval Benchmark
 
-An earlier scoped diagnostic showed:
+The primary result uses all 883 development examples and restricts retrieval to the report paired
+with each question, matching FinQA's task definition:
 
 ```text
-dense retrieval, limit 10, top_k 10
-global recall@10:  0.8167
-example recall@10: 0.9500
+method: bm25
+scope: example (report-scoped)
+rerank: true
+examples: 883
+mrr: 0.7160
+hit_rate@3: 0.8618
+recall@3: 0.7194
+hit_rate@5: 0.9309
+recall@5: 0.8397
+hit_rate@10: 0.9796
+recall@10: 0.9342
 ```
 
-This suggests the system retrieves evidence much better once it is searching inside the correct
-FinQA example. In other words, global document/example selection is a real bottleneck.
+The gap between Hit@5 and Recall@5 shows the remaining retrieval problem: the system usually finds
+at least one supporting fact, but multi-fact numerical questions can still be missing an operand.
+
+### Open-Corpus Extension
+
+The global experiment removes the known-report constraint and searches all 25,951 chunks from the
+883 reports. This is intentionally harder than the standard FinQA benchmark:
+
+```text
+method: adaptive
+scope: global
+rerank: true
+examples: 883
+mrr: 0.3410
+hit_rate@3: 0.4575
+recall@3: 0.3448
+hit_rate@5: 0.6014
+recall@5: 0.4642
+hit_rate@10: 0.7225
+recall@10: 0.5914
+```
+
+Fixing neighbor expansion so ranked seed results stay ahead of their contextual neighbors raised
+global adaptive Hit@5 from `0.3998` to `0.6014` and MRR from `0.2665` to `0.3410`. The result also
+shows why report-scoped and global scores must be labeled separately: many FinQA questions assume
+the associated report and do not contain enough company or document information for reliable global
+document discovery.
 
 ### Structured Calculation
 
@@ -619,71 +685,20 @@ error_rate: 0.0000
 This suggests deterministic execution helps, but the model still sometimes chooses the wrong operands
 or operation.
 
-### Global Reranking Experiment
-
-The global experiment runner compared dense, BM25, hybrid, and adaptive retrieval with and without
-the heuristic reranker:
-
-```bash
-.venv/bin/python evaluation/run_global_experiment.py \
-  --skip-index \
-  --eval-limit 100 \
-  --answer-limit 20 \
-  --max-k 10 \
-  --candidate-k 30 \
-  --include-rerank \
-  --run-answers
-```
-
-Retrieval improved across all methods:
-
-```text
-method      baseline recall@10   reranked recall@10
-dense       0.8258               0.8692
-bm25        0.7417               0.7908
-hybrid      0.7908               0.8358
-adaptive    0.7767               0.8325
-```
-
-Final answer quality improved most with adaptive retrieval plus reranking:
-
-```text
-configuration       numerical_match   insufficient_evidence_rate   execution_success_rate
-dense baseline      0.4737            0.3684                       0.5263
-dense reranked      0.5263            0.3158                       0.6316
-hybrid baseline     0.5263            0.3684                       0.5263
-adaptive baseline   0.5000            0.3500                       0.5500
-adaptive reranked   0.6111            0.1667                       0.7222
-```
-
-The initial adaptive reranked run exposed two parser failures when the model returned `null` for
-list-shaped JSON fields. Those were fixed by normalizing missing `citations` and `calculation_steps`
-to empty lists. A follow-up 20-example run completed without pipeline, citation, or execution errors:
-
-```text
-adaptive reranked fixed
-completed: 20/20
-error_rate: 0.0000
-citation_validity: 1.0000
-execution_error_rate: 0.0000
-```
-
-The best-performing path is therefore more stable, but numerical accuracy still varies across runs
-because the LLM can choose different operands or abstain even when the pipeline itself succeeds.
-
 The current engineering narrative is:
 
 ```text
-measure -> diagnose retrieval and calculation bottlenecks -> add reranking and deterministic
-calculation execution -> remeasure -> improve numerical accuracy and reduce abstention
+measure -> separate benchmark scope from open-corpus scope -> diagnose ranking and calculation
+bottlenecks -> fix and remeasure on the complete development set
 ```
 
 ## Development Notes
 
 - Keep retrieval and generation evaluation separate. If answer quality is poor, first check whether
   the gold evidence was retrieved.
-- Use `--scope example` only as a diagnostic baseline. It uses gold example IDs and should not be
-  treated as a production score.
+- Use `--scope example` for the primary FinQA benchmark. It supplies the paired report ID, as FinQA
+  intends, but does not expose the gold evidence rows.
+- Use `--scope global` only for the separately labeled open-corpus extension.
 - Use distinct prediction paths for each experiment so results do not overwrite each other.
 - Rebuild chunks and embeddings when changing dataset split or index size.
 - Avoid trusting `exact_match` alone for financial answers because unit formatting often differs.
@@ -691,10 +706,9 @@ calculation execution -> remeasure -> improve numerical accuracy and reduce abst
 
 ## Recommended Next Improvements
 
-1. Add a document/page selection stage before chunk retrieval.
-2. Replace the current heuristic reranker with a stronger cross-encoder or LLM reranker.
-3. Improve program generation by validating that operands appear in cited chunks.
-4. Add support for FinQA table aggregate programs such as `table_average`, `table_sum`, `table_min`,
+1. Improve report-scoped Recall@3 and Recall@5 with a trained cross-encoder or stronger reranker.
+2. Improve program generation by validating that operands appear in cited chunks.
+3. Add support for FinQA table aggregate programs such as `table_average`, `table_sum`, `table_min`,
    and `table_max`.
-5. Calibrate the evidence grader against strict gold evidence labels.
-6. Evaluate on larger indexed subsets after rebuilding the full required index.
+4. Calibrate the evidence grader against strict gold evidence labels.
+5. For the open-corpus extension, add a document/page selection stage before chunk retrieval.

@@ -220,12 +220,13 @@ def expand_with_neighbors(
         return results
 
     lookup = build_neighbor_lookup(chunks)
-    expanded_chunks: dict[str, tuple[float, Chunk]] = {}
+    expanded_chunks: dict[str, tuple[float, Chunk]] = {
+        result.chunk.chunk_id: (result.score, result.chunk)
+        for result in results
+    }
 
     for result in results:
         chunk = result.chunk
-        expanded_chunks.setdefault(chunk.chunk_id, (result.score, chunk))
-
         key = neighbor_key(chunk)
         if key is None:
             continue
@@ -407,7 +408,7 @@ def resolve_retrieval_route(
     neighbor_window: int,
 ) -> RetrievalRoute:
     if method == ADAPTIVE_METHOD:
-        return route_question(query)
+        return route_question(query, candidate_k=candidate_k)
 
     if method not in SUPPORTED_RETRIEVAL_METHODS:
         raise ValueError(f"Unsupported retrieval method: {method}")

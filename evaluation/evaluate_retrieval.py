@@ -209,7 +209,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-k", type=int, default=DEFAULT_MAX_K)
     parser.add_argument("--neighbor-window", type=int, default=0)
     parser.add_argument("--method", choices=["dense", "bm25", "hybrid", "adaptive"], default="dense")
-    parser.add_argument("--scope", choices=sorted(RETRIEVAL_SCOPES), default="global")
+    parser.add_argument("--scope", choices=sorted(RETRIEVAL_SCOPES), default="example")
     parser.add_argument("--rerank", action="store_true")
     parser.add_argument("--failure-cutoff", type=int, default=5)
     parser.add_argument("--failures-path")

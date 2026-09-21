@@ -502,7 +502,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--predictions-path", default=str(DEFAULT_RESULTS_PATH))
     parser.add_argument("--use-evidence-grader", action="store_true")
-    parser.add_argument("--scope", choices=sorted(RETRIEVAL_SCOPES), default="global")
+    parser.add_argument("--scope", choices=sorted(RETRIEVAL_SCOPES), default="example")
     parser.add_argument("--rerank", action="store_true")
     return parser.parse_args()
 

@@ -174,7 +174,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", default=str(DEFAULT_DATASET_PATH))
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--method", choices=["dense", "bm25", "hybrid", "adaptive"], default="dense")
-    parser.add_argument("--scope", choices=sorted(RETRIEVAL_SCOPES), default="global")
+    parser.add_argument("--scope", choices=sorted(RETRIEVAL_SCOPES), default="example")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--candidate-k", type=int, default=20)
     parser.add_argument("--neighbor-window", type=int, default=0)
